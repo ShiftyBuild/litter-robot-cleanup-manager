@@ -72,7 +72,7 @@ definition(
     iconX2Url: "",
     // Set this to your own raw GitHub URL and Hubitat's "Import" button will pull
     // updates in place, which is the closest thing the platform has to real VCS.
-    importUrl: "https://raw.githubusercontent.com/CHANGE-ME/hubitat/main/apps/litter-robot-cleanup-manager.groovy"
+    importUrl: "https://raw.githubusercontent.com/ShiftyBuild/litter-robot-cleanup-manager/main/litter-robot-cleanup-manager.groovy"
 )
 
 preferences {
