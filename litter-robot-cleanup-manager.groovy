@@ -32,6 +32,10 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.3  Added a "Turn auto-clean on" button on the Status page -- appears
+ *         only while the app enabled switch is off, and turns it back on
+ *         directly rather than requiring the user to find and toggle the
+ *         switch device itself. Pairs with the 2.1.2 disabled indicator.
  *  2.1.2  The app enabled switch being off wasn't reflected anywhere in the
  *         Status page or app label -- Phase still showed CLEAN/normal with
  *         no indication motion was being ignored. Added an "Enabled: No"
@@ -114,7 +118,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.2"
+@Field static final String APP_VERSION = "2.1.3"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -169,6 +173,9 @@ def mainPage() {
         section("Status") {
             paragraph statusText()
             input "btnReset", "button", title: "Reset to CLEAN now"
+            if (enableSwitch && !isEnabled()) {
+                input "btnEnable", "button", title: "Turn auto-clean on"
+            }
         }
 
         section("Configuration") {
@@ -830,6 +837,11 @@ void appButtonHandler(String btn) {
             state.lastFault = null
             state.lastFaultReason = null
             resetToIdle()
+            break
+        case "btnEnable":
+            logInfo "Auto-clean turned back on from the app's own Status page"
+            addHistory("Auto-clean turned on (manual)")
+            enableSwitch.on()
             break
         case "btnClearHistory":
             state.history = []
