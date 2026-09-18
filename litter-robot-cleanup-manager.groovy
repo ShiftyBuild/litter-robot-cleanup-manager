@@ -32,6 +32,12 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.5  Added a "Reset all timing settings to recommended defaults" button
+ *         on the Timing page. Writes every timing setting back to this
+ *         app's built-in defaults via app.updateSetting() -- clears out
+ *         stale values left over from earlier versions or manual hub-side
+ *         tweaks (e.g. a renamed setting that silently fell back to null,
+ *         or a value like the 131s cycleTimeoutSec found this session).
  *  2.1.4  Fixed a race: the two drum contacts can open within milliseconds
  *         of each other at rotation start, and Hubitat can run their event
  *         handlers as overlapping executions that each read state.phase as
@@ -129,7 +135,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.4"
+@Field static final String APP_VERSION = "2.1.5"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -345,6 +351,15 @@ private childStatusText() {
 def timingPage() {
     dynamicPage(name: "timingPage", title: "Timing") {
 
+        section("Reset") {
+            input "btnResetTiming", "button", title: "Reset all timing settings to recommended defaults"
+            paragraph "<small>Resets every setting on this page back to this app's built-in defaults -- " +
+                      "useful for clearing out stale values left over from an earlier version or a " +
+                      "manual tweak (e.g. a renamed setting that silently fell back to null, or a value " +
+                      "tuned for behavior a previous version no longer has). Does not touch device " +
+                      "selections, notifications, or restrictions on the other pages.</small>"
+        }
+
         section("The wait") {
             input "waitMinutes", "number",
                 title: "Wait window (minutes)",
@@ -424,6 +439,26 @@ def timingPage() {
                       "drum or a sensor that stopped reporting.</small>"
         }
     }
+}
+
+// Keep in sync with the defaultValue: on each input in timingPage() above --
+// this is what "Reset all timing settings to recommended defaults" writes.
+private void resetTimingDefaults() {
+    [
+        waitMinutes:      [value: "15",  type: "number"],
+        maxHoldMinutes:   [value: "45",  type: "number"],
+        initialPulseSec:  [value: "60",  type: "number"],
+        reassertPulseSec: [value: "90",  type: "number"],
+        rotateTimeoutSec: [value: "540", type: "number"],
+        cycleTimeoutSec:  [value: "300", type: "number"],
+        homeDebounceSec:  [value: "30",  type: "number"],
+        maxAttempts:      [value: "3",   type: "number"],
+        retryPulseSec:    [value: "5",   type: "number"],
+        cooldownSec:      [value: "90",  type: "number"],
+        watchdogMinutes:  [value: "90",  type: "number"],
+    ].each { key, cfg -> app.updateSetting(key, cfg) }
+    logWarn "All timing settings reset to recommended defaults"
+    addHistory("Timing settings reset to recommended defaults")
 }
 
 // ============================================================================
@@ -853,6 +888,9 @@ void appButtonHandler(String btn) {
             logInfo "Auto-clean turned back on from the app's own Status page"
             addHistory("Auto-clean turned on (manual)")
             enableSwitch.on()
+            break
+        case "btnResetTiming":
+            resetTimingDefaults()
             break
         case "btnClearHistory":
             state.history = []
