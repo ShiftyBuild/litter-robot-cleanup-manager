@@ -29,11 +29,14 @@
  *  CYCLING    drum is physically rotating. Motion is deliberately ignored -- rotation
  *             cannot be stopped, and pulsing here would orphan the sequence.
  *
- *  Author: Dan Schaff
- *
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.0.3  Removed the author's real name from the doc header and definition()
+ *         metadata (author/namespace now "ShiftyBuild") -- this repo is public.
+ *  2.0.2  Status section's "next" line now shows a single next expected action
+ *         with both its clock time and a countdown (e.g. "pulses cat sensor at
+ *         9:32:49 PM (in 12m)"), instead of listing every pending timer.
  *  2.0.1  Fixed a crash introduced by the 2.0.0 settings rename/additions: Hubitat
  *         does not backfill a new or renamed input's defaultValue into a running
  *         app's settings until that input's page is opened and saved -- a code-only
@@ -88,7 +91,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.0.1"
+@Field static final String APP_VERSION = "2.0.3"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -113,8 +116,8 @@ import groovy.transform.Field
 
 definition(
     name: "Litter Robot Cleanup Manager",
-    namespace: "dschaff",
-    author: "Dan Schaff",
+    namespace: "ShiftyBuild",
+    author: "ShiftyBuild",
     description: "Waits out motion, then pulses the Litter-Robot cat sensor and confirms the drum cycled.",
     category: "Convenience",
     iconUrl: "",
@@ -538,16 +541,15 @@ private statusText() {
     return lines.join("<br>")
 }
 
-// What's coming next for the sequence in progress, from the deadlines
-// scheduleTimer() recorded. Only ever shows timers relevant to the current
-// phase -- a stale deadline from a phase we've since left is never displayed.
+// The single soonest scheduled event for the sequence in progress, from the
+// deadlines scheduleTimer() recorded, with both its clock time and a countdown.
+// Only ever considers timers relevant to the current phase -- a stale deadline
+// from a phase we've since left is never a candidate.
 private String upcomingEventsText() {
-    def rows = []
+    def candidates = []
     def add = { String label, Long epoch ->
-        if (epoch == null) return
-        def secs = ((epoch - now()) / 1000) as int
-        if (secs <= 0) return
-        rows << "${label} in ${fmtSecs(secs)}"
+        if (epoch == null || epoch <= now()) return
+        candidates << [label: label, epoch: epoch]
     }
 
     switch (state.phase) {
@@ -573,7 +575,11 @@ private String upcomingEventsText() {
             return null
     }
     add("watchdog forces reset", state.deadlines?.watchdog)
-    return rows ? "<b>Next:</b> ${rows.join('; ')}" : null
+
+    if (!candidates) return null
+    def next = candidates.min { it.epoch }
+    def secs = ((next.epoch - now()) / 1000) as int
+    return "<b>Next expected action:</b> ${next.label} at ${fmt(next.epoch)} (in ${fmtSecs(secs)})"
 }
 
 // Rolling average of how long the last few confirmed cycles actually took.
