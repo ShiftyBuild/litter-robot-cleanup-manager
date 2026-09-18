@@ -32,6 +32,17 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.4  Fixed a race: the two drum contacts can open within milliseconds
+ *         of each other at rotation start, and Hubitat can run their event
+ *         handlers as overlapping executions that each read state.phase as
+ *         COUNTDOWN before either's setPhase() write lands -- logging the
+ *         COUNTDOWN -> CYCLING transition twice. Added an atomicState-backed
+ *         one-shot latch (atomicState writes are immediately visible across
+ *         executions, unlike buffered state) so only the first event wins;
+ *         unscheduleAll() clears it whenever a sequence ends. Found while
+ *         investigating a false "never returned home" fault -- the real
+ *         cause of that fault was a stale hub-side cycleTimeoutSec (131s,
+ *         fixed on the Timing page, not a code change).
  *  2.1.3  Added a "Turn auto-clean on" button on the Status page -- appears
  *         only while the app enabled switch is off, and turns it back on
  *         directly rather than requiring the user to find and toggle the
@@ -118,7 +129,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.3"
+@Field static final String APP_VERSION = "2.1.4"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -935,6 +946,18 @@ def contactHandler(evt) {
         if (state.phase == "COUNTDOWN") {
             noteContactOpened(evt.device.id as String)
             if (rotationStarted()) {
+                // Two drum contacts can open within milliseconds of each other at
+                // rotation start, and Hubitat can run their event handlers as
+                // overlapping executions that each read state.phase as COUNTDOWN
+                // before either's setPhase() write lands -- causing a duplicate
+                // transition. atomicState is visible immediately across
+                // executions (unlike buffered state), so use it as a one-shot
+                // latch; unscheduleAll() clears it whenever a sequence ends.
+                if (atomicState.cyclingLatch) {
+                    logDebug "Rotation already confirmed by a concurrent event -- skipping duplicate transition"
+                    return
+                }
+                atomicState.cyclingLatch = true
                 logInfo "Drum rotation detected -- confirming completion"
                 clearTimer("rotateTimeout")
                 setPhase("CYCLING")
@@ -1331,6 +1354,7 @@ private void updateStatusLight() {
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
      "reassertPulseDone", "confirmHome", "cycleTimeout", "watchdog"].each { clearTimer(it) }
+    atomicState.cyclingLatch = false
 }
 
 // ============================================================================
