@@ -32,6 +32,13 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.2  The app enabled switch being off wasn't reflected anywhere in the
+ *         Status page or app label -- Phase still showed CLEAN/normal with
+ *         no indication motion was being ignored. Added an "Enabled: No"
+ *         status line and a gray "disabled" suffix on the app label,
+ *         refreshed immediately on either direction of the switch (not just
+ *         on the next phase change). Also renamed the "Reset to idle now"
+ *         button to "Reset to CLEAN now" to match the phase display rename.
  *  2.1.1  Corrected the "Release -> rotation" default from 300s (3-minute
  *         Clean Cycle Wait assumption) to 540s -- log analysis confirmed
  *         this robot's actual wait setting is 7 minutes, so the old default
@@ -107,7 +114,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.1"
+@Field static final String APP_VERSION = "2.1.2"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -161,7 +168,7 @@ def mainPage() {
 
         section("Status") {
             paragraph statusText()
-            input "btnReset", "button", title: "Reset to idle now"
+            input "btnReset", "button", title: "Reset to CLEAN now"
         }
 
         section("Configuration") {
@@ -541,6 +548,9 @@ private statusText() {
     def lines = []
     lines << "<b>Version:</b> ${APP_VERSION}"
     lines << "<b>Phase:</b> ${phaseLabel(state.phase ?: 'IDLE')}"
+    if (enableSwitch && !isEnabled()) {
+        lines << "<b>Enabled:</b> No — ${enableSwitch.displayName} is off, motion is being ignored"
+    }
 
     def estBits = []
     def avg = avgCycleDurationSec()
@@ -710,7 +720,7 @@ def initialize() {
 
     subscribe(motionSensor, "motion", "motionHandler")
     subscribe(drumContacts, "contact", "contactHandler")
-    subscribe(enableSwitch, "switch.off", "enableOffHandler")
+    subscribe(enableSwitch, "switch", "enableSwitchHandler")
     subscribe(drumContacts, "battery", "batteryHandler")
     checkBatteryLevels()
 
@@ -746,9 +756,16 @@ def initialize() {
 
 private updateLabel() {
     def phase = state.phase ?: "IDLE"
-    def color = (phase == "IDLE") ? "green" : "orange"
-    if (phase == "IDLE" && faultActive()) color = "red"
-    app.updateLabel("Litter Robot Cleanup Manager <span style='color:${color}'>(${phaseLabel(phase)})</span>")
+    def suffix = ""
+    def color
+    if (!isEnabled()) {
+        color = "gray"
+        suffix = " disabled"
+    } else {
+        color = (phase == "IDLE") ? "green" : "orange"
+        if (phase == "IDLE" && faultActive()) color = "red"
+    }
+    app.updateLabel("Litter Robot Cleanup Manager <span style='color:${color}'>(${phaseLabel(phase)}${suffix})</span>")
 }
 
 private boolean faultActive() {
@@ -927,12 +944,16 @@ def contactHandler(evt) {
     }
 }
 
-def enableOffHandler(evt) {
-    if (state.phase != "IDLE") {
+def enableSwitchHandler(evt) {
+    if (evt.value == "off" && state.phase != "IDLE") {
         logWarn "${enableSwitch.displayName} turned off during a ${state.phase} sequence -- aborting"
         addHistory("Disabled during ${phaseLabel(state.phase)}; sequence aborted")
         resetToIdle()
     }
+    // Covers both directions -- label shows "disabled" the moment the switch
+    // goes off, and clears it the moment it comes back on, not just on the
+    // next phase change.
+    updateLabel()
 }
 
 def batteryHandler(evt) {
