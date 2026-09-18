@@ -495,6 +495,7 @@ private restrictionSummary() {
 
 private statusText() {
     def lines = []
+    lines << "<b>Version:</b> ${APP_VERSION}"
     lines << "<b>Phase:</b> ${state.phase ?: 'IDLE'}"
 
     def estBits = []
