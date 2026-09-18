@@ -32,6 +32,22 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.1  Corrected the "Release -> rotation" default from 300s (3-minute
+ *         Clean Cycle Wait assumption) to 540s -- log analysis confirmed
+ *         this robot's actual wait setting is 7 minutes, so the old default
+ *         was firing a spurious retry pulse roughly 2 minutes before the
+ *         drum actually started rotating on every cycle.
+ *  2.1.0  Added battery monitoring for the drum position contact sensors.
+ *         Notifies (via the existing notification devices) the first time a
+ *         sensor's reported battery drops below a configurable threshold
+ *         (default 50%), and again if it recovers and drops below a second
+ *         time. Checked on every battery report the sensor sends, plus once
+ *         on every save/boot to catch a sensor already low at startup.
+ *  2.0.4  User-facing phase names cleaned up: IDLE displays as "CLEAN" and
+ *         COUNTDOWN displays as "LR-TIMER" on the Status page, in History,
+ *         and in notifications. Internal phase values (used by the state
+ *         machine's own logic) are unchanged; WAIT/PULSE/REASSERT/CYCLING
+ *         still display under their existing names.
  *  2.0.3  Removed the author's real name from the doc header and definition()
  *         metadata (author/namespace now "ShiftyBuild") -- this repo is public.
  *  2.0.2  Status section's "next" line now shows a single next expected action
@@ -91,7 +107,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.0.3"
+@Field static final String APP_VERSION = "2.1.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -270,6 +286,20 @@ def devicePage() {
                 title: "Notify when a hold is force-released (max hold or restriction cap)",
                 defaultValue: true
         }
+
+        section("Optional — battery monitoring") {
+            input "batteryMonitorEnabled", "bool",
+                title: "Notify when a drum contact sensor's battery drops low",
+                defaultValue: true
+            input "batteryThreshold", "number",
+                title: "Low battery threshold (%)",
+                defaultValue: 50, required: true, range: "1..99"
+            paragraph "<small>Checked whenever a drum contact sensor reports its battery level " +
+                      "(most report this periodically on their own, not on every open/close) and " +
+                      "once whenever this app's settings are saved. Notifies once when a sensor " +
+                      "first drops below the threshold, then again if it recovers and later drops " +
+                      "below it a second time. Uses the notification devices above.</small>"
+        }
     }
 }
 
@@ -329,9 +359,10 @@ def timingPage() {
         section("The cycle") {
             input "rotateTimeoutSec", "number",
                 title: "Release → rotation (seconds)",
-                defaultValue: 300, required: true, range: "30..1800"
+                defaultValue: 540, required: true, range: "30..1800"
             paragraph "<small>The robot's own internal timer plus margin. Use ~300 for the 3-minute " +
-                      "setting, ~540 for the 7-minute setting.</small>"
+                      "setting, ~540 for the 7-minute setting (confirmed via log analysis to be this " +
+                      "robot's actual setting), ~1020 for the 15-minute setting.</small>"
             input "cycleTimeoutSec", "number",
                 title: "Rotation → home (seconds)",
                 defaultValue: 300, required: true, range: "30..1800"
@@ -481,6 +512,7 @@ private deviceSummary() {
     if (autoCreateOutputs) bits << "${getChildDevices().size()} app-managed output(s)"
     if (statusLight) bits << "status light: ${statusLight.displayName}"
     if (notifiers) bits << "${notifiers.size()} notifier(s)"
+    if (batteryMonitorEnabled != false) bits << "battery alert <${batteryThreshold ?: 50}%"
     return bits.join(" · ")
 }
 
@@ -508,7 +540,7 @@ private restrictionSummary() {
 private statusText() {
     def lines = []
     lines << "<b>Version:</b> ${APP_VERSION}"
-    lines << "<b>Phase:</b> ${state.phase ?: 'IDLE'}"
+    lines << "<b>Phase:</b> ${phaseLabel(state.phase ?: 'IDLE')}"
 
     def estBits = []
     def avg = avgCycleDurationSec()
@@ -538,6 +570,10 @@ private statusText() {
         lines << "<b>Last confirmed cycle:</b> ${fmt(state.lastSuccess)}${tookText}"
     }
     if (state.lastFault)   lines << "<b>Last fault:</b> ${state.lastFaultReason} — ${fmt(state.lastFault)}"
+    if (state.lowBatteryDevices) {
+        def bits = state.lowBatteryDevices.collect { k, v -> "${v.name} (${v.pct}%)" }
+        lines << "<b>Low battery:</b> ${bits.join(', ')}"
+    }
     return lines.join("<br>")
 }
 
@@ -626,6 +662,15 @@ private String fmtSecs(int secs) {
     return (mins < 60) ? "${mins}m" : "${(mins / 60) as int}h ${mins % 60}m"
 }
 
+// User-facing display name for a phase. Internal state.phase values (IDLE,
+// WAIT, PULSE, COUNTDOWN, REASSERT, CYCLING) are unchanged -- this only
+// affects what's shown on the Status page, in History, and in notifications.
+@Field static final Map<String, String> PHASE_LABELS = [IDLE: "CLEAN", COUNTDOWN: "LR-TIMER"]
+
+private String phaseLabel(String phase) {
+    return PHASE_LABELS[phase] ?: phase
+}
+
 // ============================================================================
 //  Lifecycle
 // ============================================================================
@@ -666,6 +711,8 @@ def initialize() {
     subscribe(motionSensor, "motion", "motionHandler")
     subscribe(drumContacts, "contact", "contactHandler")
     subscribe(enableSwitch, "switch.off", "enableOffHandler")
+    subscribe(drumContacts, "battery", "batteryHandler")
+    checkBatteryLevels()
 
     // Hubitat convention: never leave debug logging on indefinitely.
     if (logEnable) {
@@ -687,7 +734,7 @@ def initialize() {
     // Rather than try to rebuild them, reset to a known-good state.
     if (state.phase != "IDLE") {
         logWarn "Settings changed during a ${state.phase} sequence -- resetting to IDLE"
-        addHistory("Config saved during ${state.phase}; forced reset")
+        addHistory("Config saved during ${phaseLabel(state.phase)}; forced reset")
         resetToIdle()
     } else {
         applyIdleOutputs()
@@ -701,7 +748,7 @@ private updateLabel() {
     def phase = state.phase ?: "IDLE"
     def color = (phase == "IDLE") ? "green" : "orange"
     if (phase == "IDLE" && faultActive()) color = "red"
-    app.updateLabel("Litter Robot Cleanup Manager <span style='color:${color}'>(${phase})</span>")
+    app.updateLabel("Litter Robot Cleanup Manager <span style='color:${color}'>(${phaseLabel(phase)})</span>")
 }
 
 private boolean faultActive() {
@@ -761,7 +808,7 @@ void appButtonHandler(String btn) {
     switch (btn) {
         case "btnReset":
             logWarn "Manual reset requested"
-            addHistory("Manual reset from ${state.phase}")
+            addHistory("Manual reset from ${phaseLabel(state.phase)}")
             faultDev()?.off()
             state.lastFault = null
             state.lastFaultReason = null
@@ -883,9 +930,47 @@ def contactHandler(evt) {
 def enableOffHandler(evt) {
     if (state.phase != "IDLE") {
         logWarn "${enableSwitch.displayName} turned off during a ${state.phase} sequence -- aborting"
-        addHistory("Disabled during ${state.phase}; sequence aborted")
+        addHistory("Disabled during ${phaseLabel(state.phase)}; sequence aborted")
         resetToIdle()
     }
+}
+
+def batteryHandler(evt) {
+    if (batteryMonitorEnabled == false) return
+    evaluateBattery(evt.device, evt.value as int)
+}
+
+// Runs once on every save/boot, since subscribe() only catches battery
+// reports from here on -- a sensor already low when the app starts wouldn't
+// otherwise be noticed until its next periodic report.
+private void checkBatteryLevels() {
+    if (batteryMonitorEnabled == false) return
+    drumContacts?.each { dev ->
+        def battery = dev.currentValue("battery")
+        if (battery != null) evaluateBattery(dev, battery as int)
+    }
+}
+
+// Notifies once when a sensor first drops below threshold, and again if it
+// later recovers and drops below a second time -- state.lowBatteryDevices
+// tracks which sensors are currently in the "already notified" state.
+private void evaluateBattery(dev, int percent) {
+    def threshold = (batteryThreshold ?: 50) as int
+    def low = state.lowBatteryDevices ?: [:]
+    def dni = "${dev.id}"
+    if (percent < threshold) {
+        if (low[dni] == null) {
+            logWarn "${dev.displayName} battery at ${percent}% -- below ${threshold}% threshold"
+            addHistory("${dev.displayName} battery low (${percent}%)")
+            sendNotif "Litter Robot: ${dev.displayName} battery at ${percent}% -- below " +
+                      "${threshold}% threshold, consider replacing."
+        }
+        low[dni] = [name: dev.displayName, pct: percent]
+    } else if (low.containsKey(dni)) {
+        addHistory("${low[dni].name} battery recovered (${percent}%)")
+        low.remove(dni)
+    }
+    state.lowBatteryDevices = low
 }
 
 // ============================================================================
@@ -1009,8 +1094,8 @@ def cycleTimeout() {
 def watchdog() {
     if (state.phase == "IDLE") return
     logWarn "Watchdog fired -- sequence stuck in ${state.phase} for ${watchdogMinutes} min"
-    addHistory("Watchdog reset from ${state.phase}")
-    sendNotif "Litter Robot: cleanup sequence stalled in ${state.phase} and was reset automatically."
+    addHistory("Watchdog reset from ${phaseLabel(state.phase)}")
+    sendNotif "Litter Robot: cleanup sequence stalled in ${phaseLabel(state.phase)} and was reset automatically."
     resetToIdle()
 }
 
@@ -1089,7 +1174,7 @@ private release() {
     }
 
     setPhase("COUNTDOWN")
-    scheduleTimer((rotateTimeoutSec ?: 300) as int, "rotateTimeout")
+    scheduleTimer((rotateTimeoutSec ?: 540) as int, "rotateTimeout")
     logInfo "Cat sensor released -- robot's timer running, watching for rotation"
 }
 
@@ -1173,7 +1258,7 @@ private applyIdleOutputs() {
 private setPhase(String p) {
     if (state.phase != p) {
         logInfo "Phase ${state.phase} -> ${p}"
-        addHistory("${state.phase} &rarr; ${p}")
+        addHistory("${phaseLabel(state.phase)} &rarr; ${phaseLabel(p)}")
         state.phase = p
         updateLabel()
     }
