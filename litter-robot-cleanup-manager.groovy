@@ -1,28 +1,58 @@
 /**
  *  Litter Robot Cleanup Manager
  *
- *  Holds the Litter-Robot's cat sensor asserted until the box has been quiet for a
- *  rolling window, then releases it and confirms the drum actually completed a cycle.
+ *  Waits out motion, then PULSES the Litter-Robot's cat sensor -- never holds it --
+ *  and confirms the drum actually completed a cycle.
+ *
+ *  Holding the cat sensor asserted for extended periods interferes with the robot's
+ *  own internal system, so the sensor is only ever asserted in short, fixed pulses
+ *  (tens of seconds), never continuously.
  *
  *  State machine:
  *
- *    IDLE ──motion──> HOLD ──quiet window elapsed──> COUNTDOWN ──rotation──> CYCLING
- *                      ^                                  │                     │
- *                      └────────── motion returns ────────┘                     │
- *                                                                               │
- *    IDLE <──── drum returned home + debounce ──────────────────────────────────┘
+ *    IDLE ──motion──> WAIT ──wait window elapsed──> PULSE ──pulse ends──> COUNTDOWN ──rotation──> CYCLING
+ *                                                                            │    ^                    │
+ *                                                                            │    └─ REASSERT pulse ───┘
+ *                                                                            └──────── motion returns ──┘
  *
- *  HOLD       cat sensor asserted; robot will not cycle. Any motion restarts the window.
- *  COUNTDOWN  cat sensor released; robot's internal timer running. Motion here re-asserts
- *             and returns to HOLD. No drum movement before the timeout means a retry.
+ *    IDLE <──────────────────────── drum returned home + debounce ─────────────────────────────────────┘
+ *
+ *  WAIT       cat sensor OFF. Needs this many minutes of continuous no-motion before
+ *             pulsing. Rolling: any motion restarts the wait window from zero.
+ *  PULSE      cat sensor ON for a short, fixed pulse -- the trigger the robot actually
+ *             needs. Never held continuously.
+ *  COUNTDOWN  cat sensor off; robot's own internal timer running toward rotation.
+ *             Motion here interrupts with a REASSERT pulse rather than a full new wait.
+ *  REASSERT   cat sensor pulsed ON again (longer than the initial pulse) because a cat
+ *             came back during COUNTDOWN. Returns to COUNTDOWN with a fresh rotation
+ *             timeout once it ends.
  *  CYCLING    drum is physically rotating. Motion is deliberately ignored -- rotation
- *             cannot be stopped, and re-asserting here would orphan the sequence.
+ *             cannot be stopped, and pulsing here would orphan the sequence.
  *
  *  Author: Dan Schaff
  *
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.0.0  Pulse-based cat sensor control, replacing continuous assertion -- holding
+ *         the robot's cat sensor on for extended periods was found to interfere with
+ *         its internal system. WAIT (renamed from HOLD) now leaves the sensor OFF for
+ *         the whole wait (quietMinutes renamed waitMinutes, default 5 -> 15 min).
+ *         Once the wait elapses, a new PULSE phase asserts the sensor for a short
+ *         fixed pulse (initialPulseSec, default 60s, capped at 90s) before handing
+ *         off to COUNTDOWN as before. Motion during COUNTDOWN no longer forces a full
+ *         new wait -- it now fires an immediate REASSERT pulse (reassertPulseSec,
+ *         default 90s, capped at 90s) and resumes COUNTDOWN once it ends. maxHold
+ *         default raised 20 -> 45 min and watchdog default raised 60 -> 90 min to
+ *         match the longer wait window. Status light and "next event" status line
+ *         updated for the new phases.
+ *  1.4.0  Optional status light (capability.colorControl): green while idle,
+ *         red while holding (motion/cat sensor asserted) or on an unresolved
+ *         fault, yellow while the robot's own countdown/cycle is running.
+ *         Status section now shows an estimated cycle time (rolling average
+ *         of confirmed cycles, plus a configured best-case estimate) and the
+ *         next scheduled event (release/timeout/watchdog ETA) while a
+ *         sequence is active.
  *  1.3.2  Lowered default timing to match real single/multi-cat visits: quiet
  *         window 20 -> 5 min, maximum hold 120 -> 20 min, watchdog 180 -> 60 min.
  *         Added worked examples to the quiet window, maximum hold, and watchdog
@@ -49,8 +79,9 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "1.3.2"
+@Field static final String APP_VERSION = "2.0.0"
 @Field static final Integer HISTORY_MAX = 25
+@Field static final Integer CYCLE_HISTORY_MAX = 10
 
 // Status outputs the app can create for itself. Deliberately excludes the cat
 // sensor remote and the enable switch: those interface with real hardware and
@@ -62,11 +93,20 @@ import groovy.transform.Field
     [key: "fault",    label: "LR Cycle Fault"],
 ]
 
+// Hue/saturation for the optional status light. Keyed by name rather than
+// relying on a driver-specific named-color lookup, so any capability.colorControl
+// device works the same way.
+@Field static final Map STATUS_COLORS = [
+    green:  [hue: 33, saturation: 100, level: 100],
+    yellow: [hue: 16, saturation: 100, level: 100],
+    red:    [hue: 0,  saturation: 100, level: 100],
+]
+
 definition(
     name: "Litter Robot Cleanup Manager",
     namespace: "dschaff",
     author: "Dan Schaff",
-    description: "Holds the Litter-Robot cat sensor until the box has been quiet, then confirms the drum cycled.",
+    description: "Waits out motion, then pulses the Litter-Robot cat sensor and confirms the drum cycled.",
     category: "Convenience",
     iconUrl: "",
     iconX2Url: "",
@@ -168,8 +208,9 @@ def devicePage() {
             input "catSensorRemote", "capability.switch",
                 title: "Litter-Robot cat presence switch",
                 required: true
-            paragraph "<small>ON asserts &quot;cat present&quot; and suppresses the cycle. " +
-                      "OFF releases and starts the robot's own internal timer. " +
+            paragraph "<small>The app only ever pulses this ON briefly (tens of seconds, never held) " +
+                      "to nudge the robot -- holding it on continuously interferes with the robot's " +
+                      "own internal system. " +
                       "<b>The app will not create this for you</b> — it has to be the switch that " +
                       "actually reaches your robot.</small>"
         }
@@ -188,7 +229,7 @@ def devicePage() {
                 input "armedSwitch", "capability.switch",
                     title: "Armed indicator — ON when idle, OFF during a sequence", required: false
                 input "sequenceSwitch", "capability.switch",
-                    title: "Sequence-active indicator — ON for the whole hold + cycle", required: false
+                    title: "Sequence-active indicator — ON for the whole wait + pulse + cycle", required: false
                 input "dirtySwitch", "capability.switch",
                     title: "Dirty indicator — ON from trigger until a confirmed cycle", required: false
                 input "faultSwitch", "capability.switch",
@@ -196,6 +237,16 @@ def devicePage() {
                 paragraph "<small>Select your existing virtual switches here if they already have " +
                           "dashboard tiles or other automations pointing at them.</small>"
             }
+        }
+
+        section("Optional — status light") {
+            input "statusLight", "capability.colorControl",
+                title: "Notification light — green idle, yellow while the robot's own " +
+                        "timer/cycle is running, red while waiting/pulsing (motion detected or cat " +
+                        "sensor pulsed) or on an unresolved fault",
+                required: false
+            paragraph "<small>Any color bulb works. The app turns it on and sets its color on " +
+                      "every phase change; it does not turn it off. Leave blank to skip.</small>"
         }
 
         section("Optional — notifications") {
@@ -227,27 +278,40 @@ private childStatusText() {
 def timingPage() {
     dynamicPage(name: "timingPage", title: "Timing") {
 
-        section("The hold") {
-            input "quietMinutes", "number",
-                title: "Quiet window (minutes)",
-                defaultValue: 5, required: true, range: "1..720"
-            paragraph "<small>Continuous no-motion required before releasing. Rolling: any motion " +
-                      "restarts it from zero, however many times." +
+        section("The wait") {
+            input "waitMinutes", "number",
+                title: "Wait window (minutes)",
+                defaultValue: 15, required: true, range: "1..720"
+            paragraph "<small>Continuous no-motion required before pulsing the cat sensor. The " +
+                      "sensor stays OFF for this entire wait -- rolling: any motion restarts it " +
+                      "from zero, however many times." +
                       "<br><b>Example:</b> a cat visits for a minute, leaves, and the box stays quiet " +
-                      "for the next 5 minutes straight — the app releases at that point. If a second " +
-                      "cat wanders in partway through those 5 minutes, the window restarts from zero " +
-                      "the moment it leaves, however many times that happens.</small>"
+                      "for the next 15 minutes straight — the app pulses the sensor at that point. " +
+                      "If a second cat wanders in partway through those 15 minutes, the window " +
+                      "restarts from zero the moment it leaves, however many times that happens.</small>"
             input "maxHoldMinutes", "number",
-                title: "Maximum hold (minutes)",
-                defaultValue: 20, required: true, range: "1..1440"
-            paragraph "<small>Force the release after this long even if motion never settles. Set " +
-                      "this to at least 3&times; the quiet window (e.g. 15-20 min for a 5 min quiet " +
-                      "window) or it will fire routinely on ordinary multi-cat traffic." +
+                title: "Maximum wait (minutes)",
+                defaultValue: 45, required: true, range: "1..1440"
+            paragraph "<small>Force a pulse after this long even if motion never settles. Set this " +
+                      "to at least 3&times; the wait window (e.g. 45 min for a 15 min wait window) " +
+                      "or it will fire routinely on ordinary multi-cat traffic." +
                       "<br><b>Example:</b> several cats trickle through back-to-back and motion never " +
-                      "settles for a full quiet window — once this many total minutes have passed " +
-                      "since the sequence started, the app stops waiting and releases anyway. If this " +
+                      "settles for a full wait window — once this many total minutes have passed " +
+                      "since the sequence started, the app stops waiting and pulses anyway. If this " +
                       "fires often, that usually means a stuck sensor or a cat that won't leave, not " +
                       "just a busy box.</small>"
+        }
+
+        section("The pulse") {
+            paragraph "<small>The Litter-Robot's own cat sensor input shouldn't be held for long " +
+                      "periods -- doing so interferes with its internal system. The app only ever " +
+                      "asserts it in short, fixed pulses, capped at 90 seconds.</small>"
+            input "initialPulseSec", "number",
+                title: "Initial pulse (seconds) — fires once the wait window elapses",
+                defaultValue: 60, required: true, range: "5..90"
+            input "reassertPulseSec", "number",
+                title: "Reassert pulse (seconds) — fires immediately if a cat returns during the countdown",
+                defaultValue: 90, required: true, range: "5..90"
         }
 
         section("The cycle") {
@@ -270,10 +334,11 @@ def timingPage() {
             input "maxAttempts", "number",
                 title: "Release attempts before declaring a fault",
                 defaultValue: 3, required: true, range: "1..10"
-            input "reassertSec", "number",
-                title: "Re-assert pulse (seconds)",
-                defaultValue: 5, required: true, range: "1..120"
-            paragraph "<small>How long to hold the cat sensor on a retry when no cat is present.</small>"
+            input "retryPulseSec", "number",
+                title: "Retry pulse (seconds)",
+                defaultValue: 5, required: true, range: "1..90"
+            paragraph "<small>If the robot never starts rotating after the initial pulse, how long " +
+                      "to pulse the cat sensor again on a retry (assuming no cat is present).</small>"
             input "cooldownSec", "number",
                 title: "Post-cycle cooldown (seconds)",
                 defaultValue: 90, required: true, range: "0..900"
@@ -281,14 +346,14 @@ def timingPage() {
                       "cannot trigger a new sequence. Set to 0 to disable.</small>"
             input "watchdogMinutes", "number",
                 title: "Watchdog (minutes)",
-                defaultValue: 60, required: true, range: "5..1440"
+                defaultValue: 90, required: true, range: "5..1440"
             paragraph "<small>Force a reset if a sequence has not finished in this long, start to " +
-                      "end — hold, countdown, and cycling together. Must exceed your maximum hold, " +
-                      "or it will cut valid holds short before they ever reach that cap." +
-                      "<br><b>Example:</b> with a 20-minute maximum hold, a 60-minute watchdog leaves " +
-                      "room for the hold cap itself plus the robot's own countdown and cycle time, " +
-                      "while still catching a sequence that's genuinely stuck — a jammed drum or a " +
-                      "sensor that stopped reporting.</small>"
+                      "end — wait, pulse, countdown, and cycling together. Must exceed your maximum " +
+                      "wait, or it will cut valid waits short before they ever reach that cap." +
+                      "<br><b>Example:</b> with a 45-minute maximum wait, a 90-minute watchdog leaves " +
+                      "room for the wait cap itself plus the pulse, the robot's own countdown, and " +
+                      "cycle time, while still catching a sequence that's genuinely stuck — a jammed " +
+                      "drum or a sensor that stopped reporting.</small>"
         }
     }
 }
@@ -330,10 +395,11 @@ def optionsPage() {
 
         section("Motion during the robot's countdown") {
             input "reassertOnCountdown", "bool",
-                title: "Re-assert the cat sensor if motion returns during the countdown",
+                title: "Fire a reassert pulse if motion returns during the countdown",
                 defaultValue: true
-            paragraph "<small>A cat returning in the 3-minute window pushes the cycle back out by " +
-                      "a full quiet window. Off: the countdown runs to completion regardless.</small>"
+            paragraph "<small>A cat returning during the countdown fires an immediate reassert pulse " +
+                      "(see the pulse length under Timing), then resumes the countdown once it ends -- " +
+                      "no full new wait. Off: the countdown runs to completion regardless.</small>"
         }
     }
 }
@@ -401,13 +467,14 @@ private deviceSummary() {
     if (!devicesReady()) return "Not yet configured"
     def bits = ["${motionSensor.displayName}", "${drumContacts.size()} drum contact(s)"]
     if (autoCreateOutputs) bits << "${getChildDevices().size()} app-managed output(s)"
+    if (statusLight) bits << "status light: ${statusLight.displayName}"
     if (notifiers) bits << "${notifiers.size()} notifier(s)"
     return bits.join(" · ")
 }
 
 private timingSummary() {
-    return "${quietMinutes ?: 20} min quiet window · max hold ${maxHoldMinutes ?: 120} min · " +
-           "${maxAttempts ?: 3} attempts"
+    return "${waitMinutes ?: 15} min wait · ${initialPulseSec ?: 60}s/${reassertPulseSec ?: 90}s pulses · " +
+           "max wait ${maxHoldMinutes ?: 45} min · ${maxAttempts ?: 3} attempts"
 }
 
 private optionsSummary() {
@@ -429,6 +496,16 @@ private restrictionSummary() {
 private statusText() {
     def lines = []
     lines << "<b>Phase:</b> ${state.phase ?: 'IDLE'}"
+
+    def estBits = []
+    def avg = avgCycleDurationSec()
+    if (avg != null) {
+        estBits << "~${fmtSecs(avg)} avg (last ${state.cycleDurations.size()} confirmed)"
+    }
+    def cfg = configuredCycleEstimateSec()
+    if (cfg != null) estBits << "~${fmtSecs(cfg)} best case (current settings)"
+    if (estBits) lines << "<b>Estimated cycle time:</b> ${estBits.join(' · ')}"
+
     if (state.phase && state.phase != "IDLE") {
         lines << "<b>Release attempts:</b> ${state.attempts ?: 0} of ${maxAttempts}"
         if (state.sequenceStarted) {
@@ -436,10 +513,73 @@ private statusText() {
                      "(${elapsed(state.sequenceStarted)} ago)"
         }
         if (state.deferredReason) lines << "<b>Deferred:</b> ${state.deferredReason}"
+        def upcoming = upcomingEventsText()
+        if (upcoming) lines << upcoming
+    } else if (state.cooldownUntil && state.cooldownUntil > now()) {
+        lines << "<b>Cooldown:</b> motion ignored for another ${fmtRemaining(state.cooldownUntil)} " +
+                 "(until ${fmt(state.cooldownUntil)})"
     }
-    if (state.lastSuccess) lines << "<b>Last confirmed cycle:</b> ${fmt(state.lastSuccess)}"
+
+    if (state.lastSuccess) {
+        def tookText = state.lastCycleDurationSec != null ? " (took ${fmtSecs(state.lastCycleDurationSec)})" : ""
+        lines << "<b>Last confirmed cycle:</b> ${fmt(state.lastSuccess)}${tookText}"
+    }
     if (state.lastFault)   lines << "<b>Last fault:</b> ${state.lastFaultReason} — ${fmt(state.lastFault)}"
     return lines.join("<br>")
+}
+
+// What's coming next for the sequence in progress, from the deadlines
+// scheduleTimer() recorded. Only ever shows timers relevant to the current
+// phase -- a stale deadline from a phase we've since left is never displayed.
+private String upcomingEventsText() {
+    def rows = []
+    def add = { String label, Long epoch ->
+        if (epoch == null) return
+        def secs = ((epoch - now()) / 1000) as int
+        if (secs <= 0) return
+        rows << "${label} in ${fmtSecs(secs)}"
+    }
+
+    switch (state.phase) {
+        case "WAIT":
+            add("pulses cat sensor", state.deadlines?.waitElapsed)
+            add("max-wait forces pulse", state.deadlines?.holdCapReached)
+            break
+        case "PULSE":
+            add("pulse ends, watching for rotation begins", state.deadlines?.pulseDone)
+            break
+        case "COUNTDOWN":
+            add("retry/fault if no rotation", state.deadlines?.rotateTimeout)
+            add("retry pulse ends", state.deadlines?.retryPulseDone)
+            break
+        case "REASSERT":
+            add("reassert pulse ends", state.deadlines?.reassertPulseDone)
+            break
+        case "CYCLING":
+            add("fault if drum doesn't return home", state.deadlines?.cycleTimeout)
+            add("confirming home", state.deadlines?.confirmHome)
+            break
+        default:
+            return null
+    }
+    add("watchdog forces reset", state.deadlines?.watchdog)
+    return rows ? "<b>Next:</b> ${rows.join('; ')}" : null
+}
+
+// Rolling average of how long the last few confirmed cycles actually took.
+private Integer avgCycleDurationSec() {
+    def list = state.cycleDurations
+    if (!list) return null
+    return (list.sum() / list.size()) as int
+}
+
+// Best-case total for a single clean visit under the current settings: the
+// full wait window, the initial pulse, and the robot's own release-to-home
+// timing budget.
+private Integer configuredCycleEstimateSec() {
+    if (!waitMinutes || !initialPulseSec || !rotateTimeoutSec || !cycleTimeoutSec) return null
+    return ((waitMinutes as int) * 60) + (initialPulseSec as int) + (rotateTimeoutSec as int) +
+           (cycleTimeoutSec as int) + ((homeDebounceSec ?: 0) as int)
 }
 
 private historyText() {
@@ -456,7 +596,15 @@ private fmt(Long epoch) {
 }
 
 private elapsed(Long since) {
-    def secs = ((now() - since) / 1000) as int
+    return fmtSecs(((now() - since) / 1000) as int)
+}
+
+private String fmtRemaining(Long epoch) {
+    return fmtSecs(((epoch - now()) / 1000) as int)
+}
+
+private String fmtSecs(int secs) {
+    if (secs < 0) secs = 0
     if (secs < 60) return "${secs}s"
     def mins = (secs / 60) as int
     return (mins < 60) ? "${mins}m" : "${(mins / 60) as int}h ${mins % 60}m"
@@ -511,12 +659,12 @@ def initialize() {
 
     // Warn about settings that will misbehave together rather than failing quietly.
     if ((watchdogMinutes as int) <= (maxHoldMinutes as int)) {
-        logWarn "Watchdog (${watchdogMinutes} min) is not longer than max hold " +
-                "(${maxHoldMinutes} min) -- valid holds will be cut short"
+        logWarn "Watchdog (${watchdogMinutes} min) is not longer than max wait " +
+                "(${maxHoldMinutes} min) -- valid waits will be cut short"
     }
-    if ((maxHoldMinutes as int) < (quietMinutes as int) * 2) {
-        logWarn "Max hold (${maxHoldMinutes} min) is less than 2x the quiet window " +
-                "(${quietMinutes} min) -- forced releases will be common"
+    if ((maxHoldMinutes as int) < (waitMinutes as int) * 2) {
+        logWarn "Max wait (${maxHoldMinutes} min) is less than 2x the wait window " +
+                "(${waitMinutes} min) -- forced pulses will be common"
     }
 
     // A settings change mid-sequence leaves timers unscheduled by updated().
@@ -530,7 +678,7 @@ def initialize() {
     }
 
     updateLabel()
-    logInfo "Initialized v${APP_VERSION}. Quiet window ${quietMinutes} min, max hold ${maxHoldMinutes} min."
+    logInfo "Initialized v${APP_VERSION}. Wait window ${waitMinutes} min, max wait ${maxHoldMinutes} min."
 }
 
 private updateLabel() {
@@ -641,24 +789,36 @@ def motionHandler(evt) {
                 startSequence()
                 break
 
-            case "HOLD":
-                // Rolling window: cancel the pending release. It gets re-armed when
-                // motion goes inactive again, giving a full fresh quiet window.
-                unschedule("quietElapsed")
+            case "WAIT":
+                // Rolling window: cancel the pending pulse. It gets re-armed when
+                // motion goes inactive again, giving a full fresh wait window.
+                clearTimer("waitElapsed")
                 state.deferredReason = null
-                logDebug "Hold extended -- quiet window cancelled, will restart on inactive"
+                logDebug "Wait extended -- window cancelled, will restart on inactive"
+                break
+
+            case "PULSE":
+                // The pulse is a short, fixed commitment -- extending it risks holding
+                // the sensor past what the robot's hardware tolerates. Noted, not acted
+                // on: if the cat is still there once it ends, the rotateTimeout retry
+                // logic re-checks live motion before deciding what to do next.
+                logDebug "Motion during initial pulse -- noted, pulse continues to completion"
                 break
 
             case "COUNTDOWN":
                 if (reassertOnCountdown == false) {
-                    logDebug "Motion during countdown -- re-assert disabled by config, ignoring"
+                    logDebug "Motion during countdown -- reassert disabled by config, ignoring"
                     return
                 }
-                logInfo "Cat returned during robot countdown -- re-asserting cat sensor"
-                addHistory("Motion during countdown; re-asserted cat sensor")
-                unschedule("rotateTimeout")
-                catSensorRemote.on()
-                enterHold()
+                logInfo "Cat returned during robot countdown -- firing reassert pulse"
+                addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseSec}s")
+                enterReassert()
+                break
+
+            case "REASSERT":
+                // Same reasoning as PULSE: let the fixed pulse finish rather than
+                // extend it.
+                logDebug "Motion during reassert pulse -- noted, pulse continues to completion"
                 break
 
             case "CYCLING":
@@ -670,9 +830,9 @@ def motionHandler(evt) {
     }
 
     // evt.value == "inactive"
-    if (state.phase == "HOLD") {
-        runIn((quietMinutes as int) * 60, "quietElapsed", [overwrite: true])
-        logDebug "Motion clear -- releasing in ${quietMinutes} min unless motion returns"
+    if (state.phase == "WAIT") {
+        scheduleTimer((waitMinutes as int) * 60, "waitElapsed")
+        logDebug "Motion clear -- pulsing in ${waitMinutes} min unless motion returns"
     }
 }
 
@@ -684,22 +844,22 @@ def contactHandler(evt) {
             noteContactOpened(evt.device.id as String)
             if (rotationStarted()) {
                 logInfo "Drum rotation detected -- confirming completion"
-                unschedule("rotateTimeout")
+                clearTimer("rotateTimeout")
                 setPhase("CYCLING")
-                runIn(cycleTimeoutSec as int, "cycleTimeout", [overwrite: true])
+                scheduleTimer(cycleTimeoutSec as int, "cycleTimeout")
             } else {
                 logDebug "Rotation partially detected (${state.openedContacts?.size() ?: 0} of " +
                          "${drumContacts.size()}) -- waiting for the rest"
             }
         } else if (state.phase == "CYCLING") {
-            unschedule("confirmHome")
+            clearTimer("confirmHome")
         }
         return
     }
 
     // evt.value == "closed"
     if (state.phase == "CYCLING" && drumIsHome()) {
-        runIn(homeDebounceSec as int, "confirmHome", [overwrite: true])
+        scheduleTimer(homeDebounceSec as int, "confirmHome")
         logDebug "Drum reads home -- confirming in ${homeDebounceSec}s"
     }
 }
@@ -721,57 +881,67 @@ def logsOff() {
     app.updateSetting("logEnable", [value: "false", type: "bool"])
 }
 
-def quietElapsed() {
-    if (state.phase != "HOLD") {
-        logDebug "quietElapsed fired in phase ${state.phase} -- ignoring"
+def waitElapsed() {
+    if (state.phase != "WAIT") {
+        logDebug "waitElapsed fired in phase ${state.phase} -- ignoring"
         return
     }
     if (motionSensor.currentValue("motion") == "active") {
-        logDebug "quietElapsed fired but motion is active -- deferring"
+        logDebug "waitElapsed fired but motion is active -- deferring"
         return
     }
 
-    // Restrictions block the release, not the hold.
+    // Restrictions block the pulse, not the wait.
     def block = releaseBlockedReason()
     if (block) {
         if (quietHoursEnabled && quietHoursAction == "skip") {
-            logInfo "Release blocked (${block}) and action is skip -- abandoning sequence"
-            addHistory("Release skipped — ${block}")
+            logInfo "Pulse blocked (${block}) and action is skip -- abandoning sequence"
+            addHistory("Pulse skipped — ${block}")
             resetToIdle()
             return
         }
         if (state.deferStarted == null) state.deferStarted = now()
         def deferredFor = ((now() - state.deferStarted) / 60000) as int
         if (deferredFor >= ((deferCapMinutes ?: 600) as int)) {
-            logWarn "Deferral cap of ${deferCapMinutes} min reached -- releasing despite ${block}"
-            addHistory("Deferral cap reached; forced release")
+            logWarn "Deferral cap of ${deferCapMinutes} min reached -- pulsing despite ${block}"
+            addHistory("Deferral cap reached; forced pulse")
             if (notifyForcedRelease != false) {
                 sendNotif "Litter Robot: cycling despite ${block} — deferred ${deferredFor} min."
             }
-            release()
+            beginPulse()
             return
         }
         state.deferredReason = "${block} (${deferredFor} min so far)"
-        unschedule("holdCapReached")   // do not count restriction time against the hold cap
-        runIn(300, "quietElapsed", [overwrite: true])
-        logInfo "Release deferred -- ${block}. Re-checking in 5 min."
+        clearTimer("holdCapReached")   // do not count restriction time against the wait cap
+        scheduleTimer(300, "waitElapsed")
+        logInfo "Pulse deferred -- ${block}. Re-checking in 5 min."
         return
     }
 
     state.deferredReason = null
     state.deferStarted = null
-    logInfo "Box quiet for ${quietMinutes} min -- releasing cat sensor"
-    release()
+    logInfo "Box quiet for ${waitMinutes} min -- starting pulse"
+    beginPulse()
 }
 
 def holdCapReached() {
-    if (state.phase != "HOLD") return
-    logWarn "Maximum hold of ${maxHoldMinutes} min reached -- releasing despite motion"
-    addHistory("Max hold ${maxHoldMinutes}m reached; forced release")
+    if (state.phase != "WAIT") return
+    logWarn "Maximum wait of ${maxHoldMinutes} min reached -- pulsing despite motion"
+    addHistory("Max wait ${maxHoldMinutes}m reached; forced pulse")
     if (notifyForcedRelease != false) {
-        sendNotif "Litter Robot: motion never settled in ${maxHoldMinutes} min. Releasing anyway -- " +
+        sendNotif "Litter Robot: motion never settled in ${maxHoldMinutes} min. Pulsing anyway -- " +
                   "something may be triggering ${motionSensor.displayName} that is not a cat."
     }
+    beginPulse()
+}
+
+def pulseDone() {
+    if (state.phase != "PULSE") return
+    release()
+}
+
+def reassertPulseDone() {
+    if (state.phase != "REASSERT") return
     release()
 }
 
@@ -792,17 +962,16 @@ def rotateTimeout() {
     }
 
     if (motionSensor.currentValue("motion") == "active") {
-        logInfo "Retrying, but motion is active -- returning to hold"
-        catSensorRemote.on()
-        enterHold()
+        logInfo "Retrying, but motion is active -- waiting for it to clear"
+        enterWait()
     } else {
         logInfo "Retrying release (attempt ${state.attempts + 1})"
         catSensorRemote.on()
-        runIn(reassertSec as int, "reassertDone", [overwrite: true])
+        scheduleTimer(retryPulseSec as int, "retryPulseDone")
     }
 }
 
-def reassertDone() {
+def retryPulseDone() {
     if (state.phase != "COUNTDOWN") return
     release()
 }
@@ -848,33 +1017,50 @@ private startSequence() {
     dirtyDev()?.on()
     faultDev()?.off()
 
-    catSensorRemote.on()
-    runIn((watchdogMinutes as int) * 60, "watchdog", [overwrite: true])
-    enterHold()
+    // Cat sensor stays OFF here -- WAIT never asserts it, only PULSE/REASSERT do.
+    scheduleTimer((watchdogMinutes as int) * 60, "watchdog")
+    enterWait()
 }
 
-private enterHold() {
-    setPhase("HOLD")
+private enterWait() {
+    setPhase("WAIT")
 
-    unschedule("quietElapsed")
-    unschedule("rotateTimeout")
-    unschedule("reassertDone")
+    clearTimer("waitElapsed")
+    clearTimer("rotateTimeout")
+    clearTimer("retryPulseDone")
 
-    // Hard cap on the hold phase, re-armed each time we enter it.
-    runIn((maxHoldMinutes as int) * 60, "holdCapReached", [overwrite: true])
+    // Hard cap on the wait phase, re-armed each time we enter it.
+    scheduleTimer((maxHoldMinutes as int) * 60, "holdCapReached")
 
     if (motionSensor.currentValue("motion") == "inactive") {
-        runIn((quietMinutes as int) * 60, "quietElapsed", [overwrite: true])
-        logDebug "Holding -- releasing in ${quietMinutes} min unless motion returns"
+        scheduleTimer((waitMinutes as int) * 60, "waitElapsed")
+        logDebug "Waiting -- pulsing the cat sensor in ${waitMinutes} min unless motion returns"
     } else {
-        logDebug "Holding -- motion active, quiet window starts when it clears"
+        logDebug "Waiting -- motion active, wait timer starts when it clears"
     }
 }
 
-private release() {
-    unschedule("quietElapsed")
-    unschedule("holdCapReached")
+private beginPulse() {
+    clearTimer("waitElapsed")
+    clearTimer("holdCapReached")
 
+    setPhase("PULSE")
+    catSensorRemote.on()
+    scheduleTimer(initialPulseSec as int, "pulseDone")
+    logInfo "Wait complete -- pulsing cat sensor for ${initialPulseSec}s"
+}
+
+private enterReassert() {
+    setPhase("REASSERT")
+    clearTimer("rotateTimeout")
+    catSensorRemote.on()
+    scheduleTimer(reassertPulseSec as int, "reassertPulseDone")
+}
+
+// Called whenever a cat-sensor pulse legitimately ends and control passes back
+// to the robot: the initial pulse, a no-rotation retry pulse, or a mid-countdown
+// reassert pulse all funnel through here.
+private release() {
     state.openedContacts = []
     catSensorRemote.off()
 
@@ -887,16 +1073,21 @@ private release() {
     }
 
     setPhase("COUNTDOWN")
-    runIn(rotateTimeoutSec as int, "rotateTimeout", [overwrite: true])
+    scheduleTimer(rotateTimeoutSec as int, "rotateTimeout")
     logInfo "Cat sensor released -- robot's timer running, watching for rotation"
 }
 
 private succeed() {
-    def dur = state.sequenceStarted ? elapsed(state.sequenceStarted) : "unknown"
+    Integer durSec = state.sequenceStarted ? (((now() - state.sequenceStarted) / 1000) as int) : null
+    def dur = durSec != null ? fmtSecs(durSec) : "unknown"
     logInfo "Cycle confirmed complete (sequence took ${dur})"
     addHistory("Cycle confirmed complete after ${dur}")
 
     state.lastSuccess = now()
+    state.lastCycleDurationSec = durSec
+    if (durSec != null) {
+        state.cycleDurations = ((state.cycleDurations ?: []) + [durSec]).takeRight(CYCLE_HISTORY_MAX)
+    }
     state.attempts = 0
     state.cooldownUntil = now() + ((cooldownSec as int) * 1000)
     state.lastFault = null
@@ -960,6 +1151,7 @@ private applyIdleOutputs() {
     sequenceDev()?.off()
     dirtyDev()?.off()
     catSensorRemote.off()
+    updateStatusLight()
 }
 
 private setPhase(String p) {
@@ -969,11 +1161,59 @@ private setPhase(String p) {
         state.phase = p
         updateLabel()
     }
+    // Outside the change check: a fault clearing or being raised without a phase
+    // change (e.g. the manual reset button) still needs to be reflected.
+    updateStatusLight()
+}
+
+// Green: idle and no unresolved fault. Red: motion has been detected and we're
+// waiting it out, or the cat sensor is actively pulsed, or a fault hasn't been
+// cleared yet -- fault wins over IDLE so the light doesn't quietly go green
+// while the fault switch is still on. Yellow: the robot's own countdown or
+// cycle is running and out of the app's hands.
+private void updateStatusLight() {
+    if (!statusLight) return
+    String color
+    if (faultActive()) {
+        color = "red"
+    } else {
+        switch (state.phase) {
+            case "WAIT":
+            case "PULSE":
+            case "REASSERT":           color = "red";    break
+            case "COUNTDOWN":
+            case "CYCLING":            color = "yellow"; break
+            default:                   color = "green"
+        }
+    }
+    try {
+        statusLight.on()
+        statusLight.setColor(STATUS_COLORS[color])
+    } catch (e) {
+        logWarn "Could not set status light (${statusLight.displayName}) to ${color}: ${e.message}"
+    }
 }
 
 private unscheduleAll() {
-    ["quietElapsed", "holdCapReached", "rotateTimeout",
-     "reassertDone", "confirmHome", "cycleTimeout", "watchdog"].each { unschedule(it) }
+    ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
+     "reassertPulseDone", "confirmHome", "cycleTimeout", "watchdog"].each { clearTimer(it) }
+}
+
+// ============================================================================
+//  Timer bookkeeping (drives the "next event" status line)
+// ============================================================================
+
+// runIn()/unschedule() wrappers that also remember each deadline as an absolute
+// epoch, since Hubitat has no general API to ask "how long until job X fires."
+private void scheduleTimer(int seconds, String handler) {
+    runIn(seconds, handler, [overwrite: true])
+    if (state.deadlines == null) state.deadlines = [:]
+    state.deadlines[handler] = now() + (seconds * 1000L)
+}
+
+private void clearTimer(String handler) {
+    unschedule(handler)
+    state.deadlines?.remove(handler)
 }
 
 // ============================================================================
