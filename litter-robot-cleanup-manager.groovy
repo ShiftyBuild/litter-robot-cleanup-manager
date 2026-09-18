@@ -34,6 +34,15 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.0.1  Fixed a crash introduced by the 2.0.0 settings rename/additions: Hubitat
+ *         does not backfill a new or renamed input's defaultValue into a running
+ *         app's settings until that input's page is opened and saved -- a code-only
+ *         paste leaves it null. waitMinutes, initialPulseSec, reassertPulseSec,
+ *         retryPulseSec (and every other numeric setting) now fall back to their
+ *         documented default wherever cast to int, so the app can never crash on
+ *         a not-yet-saved setting again. If you hit "GroovyCastException ... to
+ *         class 'int'" on 2.0.0, open the Timing page and press Done once to clear
+ *         it immediately; 2.0.1 makes that step unnecessary going forward.
  *  2.0.0  Pulse-based cat sensor control, replacing continuous assertion -- holding
  *         the robot's cat sensor on for extended periods was found to interfere with
  *         its internal system. WAIT (renamed from HOLD) now leaves the sensor OFF for
@@ -79,7 +88,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.0.0"
+@Field static final String APP_VERSION = "2.0.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -659,11 +668,11 @@ def initialize() {
     }
 
     // Warn about settings that will misbehave together rather than failing quietly.
-    if ((watchdogMinutes as int) <= (maxHoldMinutes as int)) {
+    if (((watchdogMinutes ?: 90) as int) <= ((maxHoldMinutes ?: 45) as int)) {
         logWarn "Watchdog (${watchdogMinutes} min) is not longer than max wait " +
                 "(${maxHoldMinutes} min) -- valid waits will be cut short"
     }
-    if ((maxHoldMinutes as int) < (waitMinutes as int) * 2) {
+    if (((maxHoldMinutes ?: 45) as int) < ((waitMinutes ?: 15) as int) * 2) {
         logWarn "Max wait (${maxHoldMinutes} min) is less than 2x the wait window " +
                 "(${waitMinutes} min) -- forced pulses will be common"
     }
@@ -832,8 +841,8 @@ def motionHandler(evt) {
 
     // evt.value == "inactive"
     if (state.phase == "WAIT") {
-        scheduleTimer((waitMinutes as int) * 60, "waitElapsed")
-        logDebug "Motion clear -- pulsing in ${waitMinutes} min unless motion returns"
+        scheduleTimer(((waitMinutes ?: 15) as int) * 60, "waitElapsed")
+        logDebug "Motion clear -- pulsing in ${waitMinutes ?: 15} min unless motion returns"
     }
 }
 
@@ -847,7 +856,7 @@ def contactHandler(evt) {
                 logInfo "Drum rotation detected -- confirming completion"
                 clearTimer("rotateTimeout")
                 setPhase("CYCLING")
-                scheduleTimer(cycleTimeoutSec as int, "cycleTimeout")
+                scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
             } else {
                 logDebug "Rotation partially detected (${state.openedContacts?.size() ?: 0} of " +
                          "${drumContacts.size()}) -- waiting for the rest"
@@ -860,7 +869,7 @@ def contactHandler(evt) {
 
     // evt.value == "closed"
     if (state.phase == "CYCLING" && drumIsHome()) {
-        scheduleTimer(homeDebounceSec as int, "confirmHome")
+        scheduleTimer((homeDebounceSec ?: 30) as int, "confirmHome")
         logDebug "Drum reads home -- confirming in ${homeDebounceSec}s"
     }
 }
@@ -957,7 +966,7 @@ def rotateTimeout() {
         fault("Robot did not begin a cycle and retries are disabled")
         return
     }
-    if (state.attempts >= (maxAttempts as int)) {
+    if (state.attempts >= ((maxAttempts ?: 3) as int)) {
         fault("Robot did not begin a cycle after ${state.attempts} release attempts")
         return
     }
@@ -968,7 +977,7 @@ def rotateTimeout() {
     } else {
         logInfo "Retrying release (attempt ${state.attempts + 1})"
         catSensorRemote.on()
-        scheduleTimer(retryPulseSec as int, "retryPulseDone")
+        scheduleTimer((retryPulseSec ?: 5) as int, "retryPulseDone")
     }
 }
 
@@ -1019,7 +1028,7 @@ private startSequence() {
     faultDev()?.off()
 
     // Cat sensor stays OFF here -- WAIT never asserts it, only PULSE/REASSERT do.
-    scheduleTimer((watchdogMinutes as int) * 60, "watchdog")
+    scheduleTimer(((watchdogMinutes ?: 90) as int) * 60, "watchdog")
     enterWait()
 }
 
@@ -1031,11 +1040,11 @@ private enterWait() {
     clearTimer("retryPulseDone")
 
     // Hard cap on the wait phase, re-armed each time we enter it.
-    scheduleTimer((maxHoldMinutes as int) * 60, "holdCapReached")
+    scheduleTimer(((maxHoldMinutes ?: 45) as int) * 60, "holdCapReached")
 
     if (motionSensor.currentValue("motion") == "inactive") {
-        scheduleTimer((waitMinutes as int) * 60, "waitElapsed")
-        logDebug "Waiting -- pulsing the cat sensor in ${waitMinutes} min unless motion returns"
+        scheduleTimer(((waitMinutes ?: 15) as int) * 60, "waitElapsed")
+        logDebug "Waiting -- pulsing the cat sensor in ${waitMinutes ?: 15} min unless motion returns"
     } else {
         logDebug "Waiting -- motion active, wait timer starts when it clears"
     }
@@ -1047,15 +1056,15 @@ private beginPulse() {
 
     setPhase("PULSE")
     catSensorRemote.on()
-    scheduleTimer(initialPulseSec as int, "pulseDone")
-    logInfo "Wait complete -- pulsing cat sensor for ${initialPulseSec}s"
+    scheduleTimer((initialPulseSec ?: 60) as int, "pulseDone")
+    logInfo "Wait complete -- pulsing cat sensor for ${initialPulseSec ?: 60}s"
 }
 
 private enterReassert() {
     setPhase("REASSERT")
     clearTimer("rotateTimeout")
     catSensorRemote.on()
-    scheduleTimer(reassertPulseSec as int, "reassertPulseDone")
+    scheduleTimer((reassertPulseSec ?: 90) as int, "reassertPulseDone")
 }
 
 // Called whenever a cat-sensor pulse legitimately ends and control passes back
@@ -1068,13 +1077,13 @@ private release() {
     if (confirmCycle == false) {
         logInfo "Cat sensor released -- cycle confirmation disabled, returning to idle"
         addHistory("Released; confirmation disabled")
-        state.cooldownUntil = now() + ((cooldownSec as int) * 1000)
+        state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
         resetToIdleKeepingRemoteOff()
         return
     }
 
     setPhase("COUNTDOWN")
-    scheduleTimer(rotateTimeoutSec as int, "rotateTimeout")
+    scheduleTimer((rotateTimeoutSec ?: 300) as int, "rotateTimeout")
     logInfo "Cat sensor released -- robot's timer running, watching for rotation"
 }
 
@@ -1090,7 +1099,7 @@ private succeed() {
         state.cycleDurations = ((state.cycleDurations ?: []) + [durSec]).takeRight(CYCLE_HISTORY_MAX)
     }
     state.attempts = 0
-    state.cooldownUntil = now() + ((cooldownSec as int) * 1000)
+    state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
     state.lastFault = null
     state.lastFaultReason = null
 
@@ -1119,7 +1128,7 @@ private fault(String reason) {
     catSensorRemote.off()
     state.attempts = 0
     state.deferredReason = null
-    state.cooldownUntil = now() + ((cooldownSec as int) * 1000)
+    state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
     updateLabel()
 }
 
