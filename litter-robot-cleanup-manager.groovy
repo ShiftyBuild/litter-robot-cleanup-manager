@@ -32,6 +32,19 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.6  Fixed the 2.1.4 race guard: the atomicState-backed latch was a
+ *         check-then-set, and log evidence from 2026-09-20 (23:57:41.617)
+ *         showed both drum-contact "open" events landing in the same
+ *         millisecond -- both executions' reads of the latch happened
+ *         before either's write committed, so the guard didn't fire and
+ *         the app logged the COUNTDOWN -> CYCLING transition twice anyway.
+ *         Replaced the inline latch with a deferred confirmRotationDetected()
+ *         job scheduled via runIn(1, ..., [overwrite: true]): Hubitat's own
+ *         job-name dedup collapses any number of same-tick schedule calls
+ *         into one queued job, so the actual phase transition now only ever
+ *         runs once regardless of how many contactHandler() executions
+ *         raced to schedule it. Harmless in practice either way (duplicate
+ *         history line only, cycle still completed), but now closed properly.
  *  2.1.5  Added a "Reset all timing settings to recommended defaults" button
  *         on the Timing page. Writes every timing setting back to this
  *         app's built-in defaults via app.updateSetting() -- clears out
@@ -135,7 +148,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.5"
+@Field static final String APP_VERSION = "2.1.6"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -988,18 +1001,14 @@ def contactHandler(evt) {
                 // rotation start, and Hubitat can run their event handlers as
                 // overlapping executions that each read state.phase as COUNTDOWN
                 // before either's setPhase() write lands -- causing a duplicate
-                // transition. atomicState is visible immediately across
-                // executions (unlike buffered state), so use it as a one-shot
-                // latch; unscheduleAll() clears it whenever a sequence ends.
-                if (atomicState.cyclingLatch) {
-                    logDebug "Rotation already confirmed by a concurrent event -- skipping duplicate transition"
-                    return
-                }
-                atomicState.cyclingLatch = true
-                logInfo "Drum rotation detected -- confirming completion"
-                clearTimer("rotateTimeout")
-                setPhase("CYCLING")
-                scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
+                // transition. A prior fix used an atomicState-backed latch here,
+                // but that's still a check-then-set: two executions can both read
+                // it as unset before either's write commits if the two contact
+                // events land in the same tick (observed live 2026-09-20). Defer
+                // to a scheduled job instead -- runIn's own overwrite:true
+                // collapses any number of same-tick schedule calls into a single
+                // queued job, so confirmRotationDetected() only ever runs once.
+                runIn(1, "confirmRotationDetected", [overwrite: true])
             } else {
                 logDebug "Rotation partially detected (${state.openedContacts?.size() ?: 0} of " +
                          "${drumContacts.size()}) -- waiting for the rest"
@@ -1015,6 +1024,20 @@ def contactHandler(evt) {
         scheduleTimer((homeDebounceSec ?: 30) as int, "confirmHome")
         logDebug "Drum reads home -- confirming in ${homeDebounceSec}s"
     }
+}
+
+// Runs once per rotation no matter how many near-simultaneous drum-contact
+// events raced to schedule it -- runIn(..., [overwrite: true]) guarantees only
+// one queued invocation of this job name exists at a time.
+def confirmRotationDetected() {
+    if (state.phase != "COUNTDOWN") {
+        logDebug "Rotation confirm job fired but phase is already ${state.phase} -- ignoring"
+        return
+    }
+    logInfo "Drum rotation detected -- confirming completion"
+    clearTimer("rotateTimeout")
+    setPhase("CYCLING")
+    scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
 }
 
 def enableSwitchHandler(evt) {
@@ -1391,8 +1414,8 @@ private void updateStatusLight() {
 
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
-     "reassertPulseDone", "confirmHome", "cycleTimeout", "watchdog"].each { clearTimer(it) }
-    atomicState.cyclingLatch = false
+     "reassertPulseDone", "confirmRotationDetected", "confirmHome", "cycleTimeout",
+     "watchdog"].each { clearTimer(it) }
 }
 
 // ============================================================================
