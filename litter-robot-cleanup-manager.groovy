@@ -32,13 +32,17 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
- *  2.1.7  Added an optional "immediate pulse on wait motion" setting
- *         (Behavior options page, default off). Normally motion during WAIT
- *         just restarts the wait window from zero and leaves the sensor
- *         off. With this on, any motion while waiting pulses the cat
- *         sensor right away instead of waiting it out -- for setups where
- *         asserting the sensor the instant a cat is detected is preferred
- *         over leaving it off during a long wait window.
+ *  2.1.8  Reverted 2.1.7. Turned out to target the wrong phase -- "pulse the
+ *         cat sensor immediately on motion" for what the user calls the
+ *         "LR wait" actually meant COUNTDOWN (displayed as "LR-TIMER"), not
+ *         the earlier WAIT phase 2.1.7 touched. COUNTDOWN already does this:
+ *         motion there fires an immediate reassert pulse via enterReassert(),
+ *         gated by the existing "Fire a reassert pulse if motion returns
+ *         during the countdown" toggle (reassertOnCountdown, default on).
+ *         Nothing new needed -- removed the unused 2.1.7 setting instead of
+ *         leaving it in place.
+ *  2.1.7  (reverted in 2.1.8) Added an optional "immediate pulse on wait
+ *         motion" setting for the WAIT phase, default off.
  *  2.1.6  Fixed the 2.1.4 race guard: the atomicState-backed latch was a
  *         check-then-set, and log evidence from 2026-09-20 (23:57:41.617)
  *         showed both drum-contact "open" events landing in the same
@@ -155,7 +159,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.7"
+@Field static final String APP_VERSION = "2.1.8"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -525,17 +529,6 @@ def optionsPage() {
                       "no full new wait. Off: the countdown runs to completion regardless.</small>"
         }
 
-        section("Motion during the wait") {
-            input "immediatePulseOnWaitMotion", "bool",
-                title: "Pulse the cat sensor immediately on any motion during the wait",
-                defaultValue: false
-            paragraph "<small>Default (off): motion during the wait just restarts the wait window from " +
-                      "zero -- the sensor stays off until the box has been quiet for the full wait " +
-                      "window (see Timing). On: any motion while waiting pulses the cat sensor right " +
-                      "away instead of waiting it out, on the theory that asserting the sensor the " +
-                      "moment a cat is detected is safer than leaving it off. Skips straight from WAIT " +
-                      "to PULSE exactly as if the wait window had already elapsed.</small>"
-        }
     }
 }
 
@@ -618,7 +611,6 @@ private optionsSummary() {
     bits << ((confirmCycle == false) ? "no cycle confirmation" : "confirm cycle")
     bits << "rotation: ${rotationDetect ?: 'any'} · home: ${homeDetect ?: 'all'}"
     if (reassertOnCountdown == false) bits << "no countdown re-assert"
-    if (immediatePulseOnWaitMotion) bits << "immediate pulse on wait motion"
     if (retryEnabled == false) bits << "no retries"
     return bits.join(" · ")
 }
@@ -964,17 +956,11 @@ def motionHandler(evt) {
                 break
 
             case "WAIT":
-                if (immediatePulseOnWaitMotion) {
-                    logInfo "Motion during wait -- pulsing cat sensor immediately (immediate-pulse mode)"
-                    addHistory("Motion during wait; pulsed cat sensor immediately")
-                    beginPulse()
-                } else {
-                    // Rolling window: cancel the pending pulse. It gets re-armed when
-                    // motion goes inactive again, giving a full fresh wait window.
-                    clearTimer("waitElapsed")
-                    state.deferredReason = null
-                    logDebug "Wait extended -- window cancelled, will restart on inactive"
-                }
+                // Rolling window: cancel the pending pulse. It gets re-armed when
+                // motion goes inactive again, giving a full fresh wait window.
+                clearTimer("waitElapsed")
+                state.deferredReason = null
+                logDebug "Wait extended -- window cancelled, will restart on inactive"
                 break
 
             case "PULSE":
