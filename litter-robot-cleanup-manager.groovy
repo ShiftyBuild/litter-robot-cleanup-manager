@@ -32,6 +32,12 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.2.2  Fixed a 2.2.0 bug: the button number/action inputs on the reset
+ *         button section only appear once resetButtonDevice is set, but the
+ *         input was missing submitOnChange: true, so Hubitat never redrew
+ *         the page after picking a device -- the follow-up fields were
+ *         invisible until some other unrelated save happened to trigger a
+ *         refresh. Added submitOnChange: true to the device picker.
  *  2.2.1  Changed WAIT's color from purple to orange (2.2.0 shipped purple).
  *  2.2.0  Two changes:
  *         (1) Reworked the status light color scheme -- red is now reserved
@@ -179,7 +185,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.2.1"
+@Field static final String APP_VERSION = "2.2.2"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -371,7 +377,7 @@ def devicePage() {
             input "resetButtonDevice", "capability.pushableButton",
                 title: "Button device — triggers the same reset as \"Reset to CLEAN now\" on the " +
                         "Status page",
-                required: false
+                required: false, submitOnChange: true
             if (resetButtonDevice) {
                 input "resetButtonNumber", "number",
                     title: "Button number", defaultValue: 1, required: true, range: "1..50"
