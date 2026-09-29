@@ -32,6 +32,7 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.2.1  Changed WAIT's color from purple to orange (2.2.0 shipped purple).
  *  2.2.0  Two changes:
  *         (1) Reworked the status light color scheme -- red is now reserved
  *         for "cat sensor is actively pulsed" only (PULSE/REASSERT). WAIT
@@ -178,7 +179,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.2.0"
+@Field static final String APP_VERSION = "2.2.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -200,8 +201,8 @@ import groovy.transform.Field
 @Field static final Map STATUS_COLORS = [
     green:  [hue: 33, saturation: 100],
     yellow: [hue: 16, saturation: 100],
+    orange: [hue: 8,  saturation: 100],
     red:    [hue: 0,  saturation: 100],
-    purple: [hue: 83, saturation: 100],
 ]
 
 // How often the fault indicator alternates between red and off, in seconds.
@@ -349,7 +350,7 @@ def devicePage() {
 
         section("Optional — status light") {
             input "statusLight", "capability.colorControl",
-                title: "Notification light — green idle, purple while waiting for the box to be " +
+                title: "Notification light — green idle, orange while waiting for the box to be " +
                         "quiet, red only while the cat sensor is actively pulsed, yellow while the " +
                         "robot's own timer/cycle is running, flashing red on an unresolved fault",
                 required: false
@@ -1477,7 +1478,7 @@ private setPhase(String p) {
     updateStatusLight()
 }
 
-// Green: idle and no unresolved fault. Purple: waiting for the box to go and
+// Green: idle and no unresolved fault. Orange: waiting for the box to go and
 // stay quiet, nothing asserted yet. Red: the cat sensor is actively pulsed
 // right now (initial pulse or a mid-countdown reassert) -- reserved for that
 // specific condition. Yellow: the robot's own countdown or cycle is running,
@@ -1494,7 +1495,7 @@ private void updateStatusLight() {
 
     String color
     switch (state.phase) {
-        case "WAIT":                color = "purple"; break
+        case "WAIT":                color = "orange"; break
         case "PULSE":
         case "REASSERT":            color = "red";    break
         case "COUNTDOWN":
