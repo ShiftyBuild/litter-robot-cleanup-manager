@@ -32,6 +32,13 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.1.9  Status light: added a brightness setting (statusLightLevel, 1-100%,
+ *         previously hardcoded to 100) and an auto-off timer that turns the
+ *         light off after N idle/clean minutes (statusLightAutoOffMinutes,
+ *         0 = never, default). Auto-off only ever applies to the green idle
+ *         state -- any phase change, fault, or new motion turns the light
+ *         back on immediately via the existing unconditional statusLight.on()
+ *         in updateStatusLight().
  *  2.1.8  Reverted 2.1.7. Turned out to target the wrong phase -- "pulse the
  *         cat sensor immediately on motion" for what the user calls the
  *         "LR wait" actually meant COUNTDOWN (displayed as "LR-TIMER"), not
@@ -159,7 +166,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.8"
+@Field static final String APP_VERSION = "2.1.9"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -176,10 +183,12 @@ import groovy.transform.Field
 // Hue/saturation for the optional status light. Keyed by name rather than
 // relying on a driver-specific named-color lookup, so any capability.colorControl
 // device works the same way.
+// Level is deliberately left out here -- it comes from the configurable
+// statusLightLevel setting instead, applied in updateStatusLight().
 @Field static final Map STATUS_COLORS = [
-    green:  [hue: 33, saturation: 100, level: 100],
-    yellow: [hue: 16, saturation: 100, level: 100],
-    red:    [hue: 0,  saturation: 100, level: 100],
+    green:  [hue: 33, saturation: 100],
+    yellow: [hue: 16, saturation: 100],
+    red:    [hue: 0,  saturation: 100],
 ]
 
 definition(
@@ -329,7 +338,16 @@ def devicePage() {
                         "sensor pulsed) or on an unresolved fault",
                 required: false
             paragraph "<small>Any color bulb works. The app turns it on and sets its color on " +
-                      "every phase change; it does not turn it off. Leave blank to skip.</small>"
+                      "every phase change. Leave blank to skip.</small>"
+            input "statusLightLevel", "number",
+                title: "Brightness (%)",
+                defaultValue: 100, required: true, range: "1..100"
+            input "statusLightAutoOffMinutes", "number",
+                title: "Turn the light off after this many minutes once idle/clean (0 = never turn off)",
+                defaultValue: 0, required: true, range: "0..1440"
+            paragraph "<small>Only applies to the green idle state -- any new motion, fault, or " +
+                      "in-progress cycle turns the light back on immediately regardless of this " +
+                      "timer.</small>"
         }
 
         section("Optional — notifications") {
@@ -595,7 +613,11 @@ private deviceSummary() {
     if (!devicesReady()) return "Not yet configured"
     def bits = ["${motionSensor.displayName}", "${drumContacts.size()} drum contact(s)"]
     if (autoCreateOutputs) bits << "${getChildDevices().size()} app-managed output(s)"
-    if (statusLight) bits << "status light: ${statusLight.displayName}"
+    if (statusLight) {
+        def lightBit = "status light: ${statusLight.displayName} @ ${statusLightLevel ?: 100}%"
+        if (((statusLightAutoOffMinutes ?: 0) as int) > 0) lightBit += ", off ${statusLightAutoOffMinutes}m after clean"
+        bits << lightBit
+    }
     if (notifiers) bits << "${notifiers.size()} notifier(s)"
     if (batteryMonitorEnabled != false) bits << "battery alert <${batteryThreshold ?: 50}%"
     return bits.join(" · ")
@@ -694,6 +716,9 @@ private String upcomingEventsText() {
         case "CYCLING":
             add("fault if drum doesn't return home", state.deadlines?.cycleTimeout)
             add("confirming home", state.deadlines?.confirmHome)
+            break
+        case "IDLE":
+            add("status light turns off", state.deadlines?.statusLightOff)
             break
         default:
             return null
@@ -1418,16 +1443,32 @@ private void updateStatusLight() {
     }
     try {
         statusLight.on()
-        statusLight.setColor(STATUS_COLORS[color])
+        statusLight.setColor(STATUS_COLORS[color] + [level: (statusLightLevel ?: 100) as int])
     } catch (e) {
         logWarn "Could not set status light (${statusLight.displayName}) to ${color}: ${e.message}"
     }
+
+    // Auto-off only ever applies to the green/idle state -- any other color means
+    // there's a pending sequence, active fault, or countdown, so cancel it there.
+    def offMin = (statusLightAutoOffMinutes ?: 0) as int
+    if (color == "green" && offMin > 0) {
+        scheduleTimer(offMin * 60, "statusLightOff")
+    } else {
+        clearTimer("statusLightOff")
+    }
+}
+
+// Scheduled callback -- turns the light off after the configured idle delay.
+// The next updateStatusLight() call (any phase change or fault) turns it back
+// on with the correct color, since statusLight.on() runs unconditionally there.
+def statusLightOff() {
+    statusLight?.off()
 }
 
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
      "reassertPulseDone", "confirmRotationDetected", "confirmHome", "cycleTimeout",
-     "watchdog"].each { clearTimer(it) }
+     "watchdog", "statusLightOff"].each { clearTimer(it) }
 }
 
 // ============================================================================
