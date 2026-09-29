@@ -32,6 +32,18 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.2.0  Two changes:
+ *         (1) Reworked the status light color scheme -- red is now reserved
+ *         for "cat sensor is actively pulsed" only (PULSE/REASSERT). WAIT
+ *         gets its own new purple color instead of sharing red. An
+ *         unresolved fault now flashes red (alternating red/off every
+ *         second) instead of a steady red, so it can never be confused with
+ *         a normal pulse. COUNTDOWN/CYCLING stay yellow, IDLE stays green.
+ *         (2) Added an optional reset button device (Devices page) --
+ *         pick any button controller, a button number, and an action
+ *         (push/hold/double-tap) to trigger the same reset as the Status
+ *         page's "Reset to CLEAN now" button. Both now share one
+ *         performManualReset() function.
  *  2.1.9  Status light: added a brightness setting (statusLightLevel, 1-100%,
  *         previously hardcoded to 100) and an auto-off timer that turns the
  *         light off after N idle/clean minutes (statusLightAutoOffMinutes,
@@ -166,7 +178,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.1.9"
+@Field static final String APP_VERSION = "2.2.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -189,7 +201,11 @@ import groovy.transform.Field
     green:  [hue: 33, saturation: 100],
     yellow: [hue: 16, saturation: 100],
     red:    [hue: 0,  saturation: 100],
+    purple: [hue: 83, saturation: 100],
 ]
+
+// How often the fault indicator alternates between red and off, in seconds.
+@Field static final Integer FAULT_BLINK_INTERVAL_SEC = 1
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -333,9 +349,9 @@ def devicePage() {
 
         section("Optional — status light") {
             input "statusLight", "capability.colorControl",
-                title: "Notification light — green idle, yellow while the robot's own " +
-                        "timer/cycle is running, red while waiting/pulsing (motion detected or cat " +
-                        "sensor pulsed) or on an unresolved fault",
+                title: "Notification light — green idle, purple while waiting for the box to be " +
+                        "quiet, red only while the cat sensor is actively pulsed, yellow while the " +
+                        "robot's own timer/cycle is running, flashing red on an unresolved fault",
                 required: false
             paragraph "<small>Any color bulb works. The app turns it on and sets its color on " +
                       "every phase change. Leave blank to skip.</small>"
@@ -348,6 +364,25 @@ def devicePage() {
             paragraph "<small>Only applies to the green idle state -- any new motion, fault, or " +
                       "in-progress cycle turns the light back on immediately regardless of this " +
                       "timer.</small>"
+        }
+
+        section("Optional — reset button") {
+            input "resetButtonDevice", "capability.pushableButton",
+                title: "Button device — triggers the same reset as \"Reset to CLEAN now\" on the " +
+                        "Status page",
+                required: false
+            if (resetButtonDevice) {
+                input "resetButtonNumber", "number",
+                    title: "Button number", defaultValue: 1, required: true, range: "1..50"
+                input "resetButtonAction", "enum",
+                    title: "Action",
+                    options: [pushed: "Push", held: "Hold", doubleTapped: "Double-tap"],
+                    defaultValue: "pushed", required: true
+                paragraph "<small>The device must support whichever action you pick here -- Hold " +
+                          "needs capability.HoldableButton, Double-tap needs " +
+                          "capability.DoubleTapableButton. Most physical button controllers support " +
+                          "at least Push.</small>"
+            }
         }
 
         section("Optional — notifications") {
@@ -620,6 +655,9 @@ private deviceSummary() {
     }
     if (notifiers) bits << "${notifiers.size()} notifier(s)"
     if (batteryMonitorEnabled != false) bits << "battery alert <${batteryThreshold ?: 50}%"
+    if (resetButtonDevice) {
+        bits << "reset button: ${resetButtonDevice.displayName} #${resetButtonNumber ?: 1} (${resetButtonAction ?: 'pushed'})"
+    }
     return bits.join(" · ")
 }
 
@@ -825,6 +863,9 @@ def initialize() {
     subscribe(drumContacts, "contact", "contactHandler")
     subscribe(enableSwitch, "switch", "enableSwitchHandler")
     subscribe(drumContacts, "battery", "batteryHandler")
+    if (resetButtonDevice) {
+        subscribe(resetButtonDevice, resetButtonAction ?: "pushed", "resetButtonHandler")
+    }
     checkBatteryLevels()
 
     // Hubitat convention: never leave debug logging on indefinitely.
@@ -927,12 +968,7 @@ private faultDev()    { autoCreateOutputs ? getChildDevice(dniFor("fault"))    :
 void appButtonHandler(String btn) {
     switch (btn) {
         case "btnReset":
-            logWarn "Manual reset requested"
-            addHistory("Manual reset from ${phaseLabel(state.phase)}")
-            faultDev()?.off()
-            state.lastFault = null
-            state.lastFaultReason = null
-            resetToIdle()
+            performManualReset("Status page button")
             break
         case "btnEnable":
             logInfo "Auto-clean turned back on from the app's own Status page"
@@ -951,6 +987,26 @@ void appButtonHandler(String btn) {
             removeChildren()
             break
     }
+}
+
+// Shared by the Status page button and the optional physical/virtual reset
+// button device -- both just need to clear any fault and force IDLE.
+private void performManualReset(String source) {
+    logWarn "Manual reset requested (${source})"
+    addHistory("Manual reset from ${phaseLabel(state.phase)} (${source})")
+    faultDev()?.off()
+    state.lastFault = null
+    state.lastFaultReason = null
+    resetToIdle()
+}
+
+// Fires on the configured action (pushed/held/doubleTapped) for the optional
+// resetButtonDevice -- only reacts to the specific button number configured,
+// since most button controllers have several.
+def resetButtonHandler(evt) {
+    def wantButton = (resetButtonNumber ?: 1) as Integer
+    if ((evt.value as Integer) != wantButton) return
+    performManualReset("${evt.device.displayName} button ${wantButton} ${evt.name}")
 }
 
 // ============================================================================
@@ -1421,25 +1477,29 @@ private setPhase(String p) {
     updateStatusLight()
 }
 
-// Green: idle and no unresolved fault. Red: motion has been detected and we're
-// waiting it out, or the cat sensor is actively pulsed, or a fault hasn't been
-// cleared yet -- fault wins over IDLE so the light doesn't quietly go green
-// while the fault switch is still on. Yellow: the robot's own countdown or
-// cycle is running and out of the app's hands.
+// Green: idle and no unresolved fault. Purple: waiting for the box to go and
+// stay quiet, nothing asserted yet. Red: the cat sensor is actively pulsed
+// right now (initial pulse or a mid-countdown reassert) -- reserved for that
+// specific condition. Yellow: the robot's own countdown or cycle is running,
+// out of the app's hands. Flashing red: an unresolved fault, which overrides
+// every other state so it can never be mistaken for a normal pulse.
 private void updateStatusLight() {
     if (!statusLight) return
-    String color
+
     if (faultActive()) {
-        color = "red"
-    } else {
-        switch (state.phase) {
-            case "WAIT":
-            case "PULSE":
-            case "REASSERT":           color = "red";    break
-            case "COUNTDOWN":
-            case "CYCLING":            color = "yellow"; break
-            default:                   color = "green"
-        }
+        startFaultBlink()
+        return
+    }
+    stopFaultBlink()
+
+    String color
+    switch (state.phase) {
+        case "WAIT":                color = "purple"; break
+        case "PULSE":
+        case "REASSERT":            color = "red";    break
+        case "COUNTDOWN":
+        case "CYCLING":             color = "yellow"; break
+        default:                    color = "green"
     }
     try {
         statusLight.on()
@@ -1465,10 +1525,53 @@ def statusLightOff() {
     statusLight?.off()
 }
 
+// Starts the flashing-red fault indicator if it isn't already running. Cancels
+// any pending auto-off first -- the light must never go dark while faulted.
+// Idempotent: repeated calls while a fault is already blinking are a no-op,
+// so a fault that logs multiple times (e.g. retries) doesn't restart the timing.
+private void startFaultBlink() {
+    clearTimer("statusLightOff")
+    if (state.faultBlinking) return
+    state.faultBlinking = true
+    state.faultBlinkOn = false
+    faultBlinkTick()
+}
+
+// Self-rescheduling toggle -- alternates the light between red and off every
+// FAULT_BLINK_INTERVAL_SEC while the fault remains active. Stops itself (and
+// restores the correct steady color) the moment the fault clears, even if
+// nothing else happens to call updateStatusLight() in the meantime.
+def faultBlinkTick() {
+    if (!statusLight || !faultActive()) {
+        stopFaultBlink()
+        updateStatusLight()
+        return
+    }
+    state.faultBlinkOn = !state.faultBlinkOn
+    try {
+        if (state.faultBlinkOn) {
+            statusLight.on()
+            statusLight.setColor(STATUS_COLORS.red + [level: (statusLightLevel ?: 100) as int])
+        } else {
+            statusLight.off()
+        }
+    } catch (e) {
+        logWarn "Could not blink status light (${statusLight.displayName}): ${e.message}"
+    }
+    runIn(FAULT_BLINK_INTERVAL_SEC, "faultBlinkTick", [overwrite: true])
+}
+
+private void stopFaultBlink() {
+    if (!state.faultBlinking) return
+    state.faultBlinking = false
+    unschedule("faultBlinkTick")
+}
+
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
      "reassertPulseDone", "confirmRotationDetected", "confirmHome", "cycleTimeout",
      "watchdog", "statusLightOff"].each { clearTimer(it) }
+    stopFaultBlink()
 }
 
 // ============================================================================
