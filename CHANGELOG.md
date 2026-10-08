@@ -4,6 +4,17 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.4.0
+Status light now boosts to at least 20% brightness (RESET_NOTIFY_LEVEL,
+only a floor -- a higher configured statusLightLevel still wins)
+right after a reset clears back to CLEAN, whether from the manual
+reset button or the v2.3.0 fault auto-recovery. At a low normal
+brightness (e.g. 5%), the color change back to green was hard to
+notice. The boost holds at green until either the phase changes
+away from idle (next real color change) or the existing
+statusLightAutoOffMinutes timer turns the light off -- whichever
+happens first -- then reverts to the normal configured brightness.
+
 ## 2.3.1
 Fixed the status light sometimes not resetting (staying red/blinking)
 after a manual reset or the new v2.3.0 auto-recovery. faultActive()

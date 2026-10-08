@@ -32,6 +32,15 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.4.0  Status light now boosts to at least 20% brightness (RESET_NOTIFY_LEVEL,
+ *         only a floor -- a higher configured statusLightLevel still wins)
+ *         right after a reset clears back to CLEAN, whether from the manual
+ *         reset button or the v2.3.0 fault auto-recovery. At a low normal
+ *         brightness (e.g. 5%), the color change back to green was hard to
+ *         notice. The boost holds at green until either the phase changes
+ *         away from idle (next real color change) or the existing
+ *         statusLightAutoOffMinutes timer turns the light off -- whichever
+ *         happens first -- then reverts to the normal configured brightness.
  *  2.3.1  Fixed the status light sometimes not resetting (staying red/blinking)
  *         after a manual reset or the new v2.3.0 auto-recovery. faultActive()
  *         was reading back faultDev()'s switch attribute right after this app
@@ -46,7 +55,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.3.1"
+@Field static final String APP_VERSION = "2.4.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -74,6 +83,13 @@ import groovy.transform.Field
 
 // How often the fault indicator alternates between red and off, in seconds.
 @Field static final Integer FAULT_BLINK_INTERVAL_SEC = 1
+
+// Minimum brightness the status light is boosted to right after a reset
+// (manual button or the fault-recovery auto-reset), so a dim normal brightness
+// (e.g. 5%) doesn't make "it's back to CLEAN" hard to notice. Only a floor --
+// if statusLightLevel is already configured higher than this, that higher
+// value wins instead of dimming things down.
+@Field static final Integer RESET_NOTIFY_LEVEL = 20
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -876,6 +892,7 @@ private void performManualReset(String source) {
     state.lastFault = null
     state.lastFaultReason = null
     state.faultRecoveryContacts = []
+    state.statusLightBoosted = true
     resetToIdle()
 }
 
@@ -891,6 +908,7 @@ private void faultRecoveryComplete() {
     state.lastFault = null
     state.lastFaultReason = null
     state.faultRecoveryContacts = []
+    state.statusLightBoosted = true
     resetToIdle()
 }
 
@@ -1427,9 +1445,19 @@ private void updateStatusLight() {
         case "CYCLING":             color = "yellow"; break
         default:                    color = "green"
     }
+
+    // The reset-notify boost (see performManualReset()/faultRecoveryComplete())
+    // only ever applies to the green/idle color it was set for -- any other
+    // color means the phase has since moved on, so the boost is stale and
+    // clears here rather than carrying over into a later idle period.
+    if (color != "green") state.statusLightBoosted = false
+    Integer configuredLevel = (statusLightLevel ?: 100) as int
+    Integer level = (color == "green" && state.statusLightBoosted) ?
+        Math.max(configuredLevel, RESET_NOTIFY_LEVEL) : configuredLevel
+
     try {
         statusLight.on()
-        statusLight.setColor(STATUS_COLORS[color] + [level: (statusLightLevel ?: 100) as int])
+        statusLight.setColor(STATUS_COLORS[color] + [level: level])
     } catch (e) {
         logWarn "Could not set status light (${statusLight.displayName}) to ${color}: ${e.message}"
     }
@@ -1447,8 +1475,12 @@ private void updateStatusLight() {
 // Scheduled callback -- turns the light off after the configured idle delay.
 // The next updateStatusLight() call (any phase change or fault) turns it back
 // on with the correct color, since statusLight.on() runs unconditionally there.
+// Also clears the reset-notify boost -- once the light has gone dark on its
+// own, the next time it comes back on should be at the normal configured
+// brightness, not still boosted from a reset that happened minutes earlier.
 def statusLightOff() {
     statusLight?.off()
+    state.statusLightBoosted = false
 }
 
 // Starts the flashing-red fault indicator if it isn't already running. Cancels
