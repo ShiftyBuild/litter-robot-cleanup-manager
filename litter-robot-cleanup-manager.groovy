@@ -32,6 +32,15 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.3.1  Fixed the status light sometimes not resetting (staying red/blinking)
+ *         after a manual reset or the new v2.3.0 auto-recovery. faultActive()
+ *         was reading back faultDev()'s switch attribute right after this app
+ *         itself sent it an off() command in the same handler -- not
+ *         guaranteed to be reflected yet, especially when autoCreateOutputs is
+ *         off and that's a real physical switch. resetToIdle() then calls
+ *         unscheduleAll(), killing the self-correcting blink job before it got
+ *         a chance to re-check. faultActive() now reads state.lastFault
+ *         instead, which this app sets/clears synchronously itself.
  *  2.3.0  Auto-recover from a fault: while a fault is active, motion is now
  *         ignored entirely (no WAIT/PULSE runs) instead of starting a normal
  *         sequence. Watching the drum contacts directly, if a full rotation
@@ -196,7 +205,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.3.0"
+@Field static final String APP_VERSION = "2.3.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -930,8 +939,18 @@ private updateLabel() {
     app.updateLabel("Litter Robot Cleanup Manager <span style='color:${color}'>(${phaseLabel(phase)}${suffix})</span>")
 }
 
+// Driven by state.lastFault, not a read-back of faultDev()'s switch attribute.
+// faultDev() may be a real physical switch when autoCreateOutputs is off, and
+// even the built-in virtual one goes through Hubitat's own command queue --
+// either way, currentValue() isn't guaranteed to reflect an off() this app just
+// sent in the same handler. That bit the status light specifically: a manual
+// reset calls unscheduleAll() (killing faultBlinkTick's self-correcting job)
+// before checking faultActive() again, so if the read-back was still stale at
+// that exact moment, nothing was left to ever flip the light back to green.
+// state.lastFault is set/cleared synchronously by this app itself, so checking
+// it instead has no such race.
 private boolean faultActive() {
-    return faultDev()?.currentValue("switch") == "on"
+    return state.lastFault != null
 }
 
 // ============================================================================
