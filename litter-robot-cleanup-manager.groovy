@@ -32,6 +32,17 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG
  *  ---------------------------------------------------------------------------
+ *  2.3.0  Auto-recover from a fault: while a fault is active, motion is now
+ *         ignored entirely (no WAIT/PULSE runs) instead of starting a normal
+ *         sequence. Watching the drum contacts directly, if a full rotation
+ *         (contacts open) followed by home (contacts close) is seen while
+ *         faulted, that's treated as the user having fixed the robot by hand
+ *         and run a clean cycle on it directly -- the fault clears and the
+ *         app returns to CLEAN automatically, the same as a manual reset but
+ *         without pressing anything in Hubitat. A fault that started with the
+ *         drum already mid-rotation (e.g. "never returned home") is handled
+ *         too, by seeding from whichever contacts are already open at the
+ *         moment the fault fires.
  *  2.2.2  Fixed a 2.2.0 bug: the button number/action inputs on the reset
  *         button section only appear once resetButtonDevice is set, but the
  *         input was missing submitOnChange: true, so Hubitat never redrew
@@ -185,7 +196,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.2.2"
+@Field static final String APP_VERSION = "2.3.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -1004,6 +1015,22 @@ private void performManualReset(String source) {
     faultDev()?.off()
     state.lastFault = null
     state.lastFaultReason = null
+    state.faultRecoveryContacts = []
+    resetToIdle()
+}
+
+// Fires when contactHandler sees a full rotation-then-home cycle while a fault
+// is active -- the user fixed the robot by hand and ran a clean cycle on it
+// directly. Clears the fault the same way a manual reset does, but driven by
+// the drum itself rather than a button, and logged distinctly so history shows
+// it wasn't the user pressing anything in Hubitat.
+private void faultRecoveryComplete() {
+    logInfo "Drum completed a full cycle while faulted -- treating as a manual fix, clearing fault"
+    addHistory("Fault cleared automatically after a manual clean cycle on the robot")
+    faultDev()?.off()
+    state.lastFault = null
+    state.lastFaultReason = null
+    state.faultRecoveryContacts = []
     resetToIdle()
 }
 
@@ -1027,6 +1054,11 @@ def motionHandler(evt) {
         switch (state.phase) {
 
             case "IDLE":
+                if (faultActive()) {
+                    logDebug "Motion ignored -- fault is active, waiting for a manual clean " +
+                             "cycle on the robot to confirm it's fixed"
+                    return
+                }
                 if (!isEnabled()) {
                     logDebug "Motion ignored -- ${enableSwitch.displayName} is off"
                     return
@@ -1092,6 +1124,24 @@ def motionHandler(evt) {
 
 def contactHandler(evt) {
     logDebug "${evt.displayName} ${evt.value} (phase ${state.phase})"
+
+    // While a fault is active, the app isn't running a sequence of its own (phase
+    // sits at IDLE, see fault()) and motionHandler ignores motion entirely. Instead,
+    // watch the drum contacts directly for a full rotation-then-home cycle -- the
+    // user fixing the problem at the robot itself and running a clean cycle by hand.
+    // Seeing that through to completion is treated as confirmation it's fixed, and
+    // clears the fault without ever touching the cat sensor or starting a WAIT timer.
+    if (state.phase == "IDLE" && faultActive()) {
+        if (evt.value == "open") {
+            noteFaultRecoveryContactOpened(evt.device.id as String)
+            if (faultRecoveryRotationStarted()) {
+                logDebug "Rotation detected during fault -- watching for home to confirm the manual fix"
+            }
+        } else if (evt.value == "closed" && faultRecoveryRotationStarted() && drumIsHome()) {
+            faultRecoveryComplete()
+        }
+        return
+    }
 
     if (evt.value == "open") {
         if (state.phase == "COUNTDOWN") {
@@ -1423,6 +1473,15 @@ private fault(String reason) {
 
     state.lastFault = now()
     state.lastFaultReason = reason
+    // Seed from whichever contacts are already open at the moment of the fault --
+    // the common case (e.g. "started rotating but never returned home") faults
+    // with the drum already mid-rotation, so no further "open" event will ever
+    // fire for those contacts. Without this, a fault that started this way could
+    // never be detected as recovered, since faultRecoveryRotationStarted() would
+    // wait forever for an "open" event that already happened before the fault.
+    state.faultRecoveryContacts = drumContacts.findAll {
+        it.currentValue("contact") == "open"
+    }.collect { it.id as String }
     faultDev()?.on()
     sendNotif "Litter Robot: ${reason}"
 
@@ -1614,6 +1673,24 @@ private boolean rotationStarted() {
         return (state.openedContacts?.size() ?: 0) >= drumContacts.size()
     }
     return (state.openedContacts?.size() ?: 0) >= 1
+}
+
+// Separate tracking from openedContacts above -- that one belongs to the normal
+// COUNTDOWN->CYCLING sequence and gets cleared by startSequence(). This is its
+// own list so a fault-recovery cycle can't collide with (or get wiped by) a
+// normal sequence's bookkeeping, and vice versa.
+private void noteFaultRecoveryContactOpened(String devId) {
+    if (state.faultRecoveryContacts == null) state.faultRecoveryContacts = []
+    if (!state.faultRecoveryContacts.contains(devId)) {
+        state.faultRecoveryContacts = state.faultRecoveryContacts + [devId]
+    }
+}
+
+private boolean faultRecoveryRotationStarted() {
+    if ((rotationDetect ?: "any") == "all") {
+        return (state.faultRecoveryContacts?.size() ?: 0) >= drumContacts.size()
+    }
+    return (state.faultRecoveryContacts?.size() ?: 0) >= 1
 }
 
 private boolean drumIsHome() {
