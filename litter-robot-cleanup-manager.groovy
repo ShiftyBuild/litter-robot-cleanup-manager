@@ -32,6 +32,19 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.4.1  Fixed the v2.3.0 fault auto-recovery clearing the fault too early.
+ *         It trusted the first "closed" event on a drum contact, but the
+ *         position sensors chatter open/closed repeatedly as multiple lobes
+ *         pass during a single rotation -- confirmed live on 2026-10-09: the
+ *         fault cleared ~2 minutes before the drum actually finished
+ *         rotating, and real motion right after started a normal WAIT cycle
+ *         instead of settling at CLEAN (what looked like "it reset into
+ *         WAIT instead of CLEAN"). Now debounces exactly like the normal
+ *         cycle-completion path (confirmHome()) does: a "closed" event
+ *         schedules a confirmFaultRecoveryHome() check after
+ *         homeDebounceSec, cancelled and re-armed by any further contact
+ *         re-open, and the fault only actually clears once the drum has
+ *         read home continuously for the full debounce window.
  *  2.4.0  Status light now boosts to at least 20% brightness (RESET_NOTIFY_LEVEL,
  *         only a floor -- a higher configured statusLightLevel still wins)
  *         right after a reset clears back to CLEAN, whether from the manual
@@ -55,7 +68,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.4.0"
+@Field static final String APP_VERSION = "2.4.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -1015,8 +1028,19 @@ def contactHandler(evt) {
             if (faultRecoveryRotationStarted()) {
                 logDebug "Rotation detected during fault -- watching for home to confirm the manual fix"
             }
+            // The drum's position sensor(s) chatter open/closed repeatedly as
+            // multiple lobes pass during a single rotation -- any contact
+            // re-opening means it isn't actually home yet, so cancel a pending
+            // confirmation the same way the normal CYCLING path does.
+            clearTimer("confirmFaultRecoveryHome")
         } else if (evt.value == "closed" && faultRecoveryRotationStarted() && drumIsHome()) {
-            faultRecoveryComplete()
+            // Don't trust the first "closed" event on its own -- it was firing
+            // on mid-rotation chatter (one contact momentarily closed while
+            // another was still open) and clearing the fault a couple of
+            // minutes before the drum actually finished, in turn letting real
+            // motion right after start a normal WAIT cycle instead of settling
+            // at CLEAN. Debounce it exactly like confirmHome() does.
+            scheduleTimer((homeDebounceSec ?: 30) as int, "confirmFaultRecoveryHome")
         }
         return
     }
@@ -1229,6 +1253,19 @@ def confirmHome() {
         return
     }
     succeed()
+}
+
+// Same debounce idea as confirmHome(), for the fault-recovery path in
+// contactHandler(). Re-checks both that a fault is still actually active (it
+// could have been cleared some other way, e.g. the manual reset button, while
+// this was pending) and that the drum still reads home before trusting it.
+def confirmFaultRecoveryHome() {
+    if (state.phase != "IDLE" || !faultActive()) return
+    if (!drumIsHome()) {
+        logDebug "confirmFaultRecoveryHome fired but the drum does not read home -- waiting"
+        return
+    }
+    faultRecoveryComplete()
 }
 
 def cycleTimeout() {
@@ -1527,8 +1564,8 @@ private void stopFaultBlink() {
 
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
-     "reassertPulseDone", "confirmRotationDetected", "confirmHome", "cycleTimeout",
-     "watchdog", "statusLightOff"].each { clearTimer(it) }
+     "reassertPulseDone", "confirmRotationDetected", "confirmHome", "confirmFaultRecoveryHome",
+     "cycleTimeout", "watchdog", "statusLightOff"].each { clearTimer(it) }
     stopFaultBlink()
 }
 

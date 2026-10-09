@@ -4,6 +4,21 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.4.1
+Fixed the v2.3.0 fault auto-recovery clearing the fault too early.
+It trusted the first "closed" event on a drum contact, but the
+position sensors chatter open/closed repeatedly as multiple lobes
+pass during a single rotation -- confirmed live on 2026-10-09: the
+fault cleared ~2 minutes before the drum actually finished
+rotating, and real motion right after started a normal WAIT cycle
+instead of settling at CLEAN (what looked like "it reset into
+WAIT instead of CLEAN"). Now debounces exactly like the normal
+cycle-completion path (confirmHome()) does: a "closed" event
+schedules a confirmFaultRecoveryHome() check after
+homeDebounceSec, cancelled and re-armed by any further contact
+re-open, and the fault only actually clears once the drum has
+read home continuously for the full debounce window.
+
 ## 2.4.0
 Status light now boosts to at least 20% brightness (RESET_NOTIFY_LEVEL,
 only a floor -- a higher configured statusLightLevel still wins)
