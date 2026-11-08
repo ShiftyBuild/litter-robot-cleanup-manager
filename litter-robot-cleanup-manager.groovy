@@ -32,6 +32,21 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.5.0  Two guards against a flaky cat-sensor switch (device commands were
+ *         failing "after 5 retries" on a degraded Zigbee mesh).
+ *         (1) Every cat-sensor on()/off() is now verified: the switch is read
+ *         back CAT_VERIFY_DELAY_SEC later and the command resent up to
+ *         CAT_VERIFY_MAX_RETRIES times. If an on() never takes, the robot was
+ *         never triggered, so the app faults right away with a specific reason
+ *         instead of waiting out several rotate-timeout retries. If an off()
+ *         never takes (sensor stuck ON, which interferes with the robot), it
+ *         notifies once and keeps retrying every CAT_OFF_RETRY_SEC.
+ *         (2) A full drum rotation seen in WAIT, PULSE or REASSERT -- the
+ *         robot cycled without the app's pulse landing, or was cycled by hand
+ *         -- is now adopted as the cycle (goes to CYCLING and finishes through
+ *         the normal home-confirm path) instead of being ignored, which used
+ *         to strand the app in WAIT. Requires every drum contact to open, so
+ *         one chattering sensor can't trigger it.
  *  2.4.1  Fixed the v2.3.0 fault auto-recovery clearing the fault too early.
  *         It trusted the first "closed" event on a drum contact, but the
  *         position sensors chatter open/closed repeatedly as multiple lobes
@@ -68,7 +83,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.4.1"
+@Field static final String APP_VERSION = "2.5.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -103,6 +118,12 @@ import groovy.transform.Field
 // if statusLightLevel is already configured higher than this, that higher
 // value wins instead of dimming things down.
 @Field static final Integer RESET_NOTIFY_LEVEL = 20
+
+// Cat-sensor command verification: how long after an on()/off() to read the
+// switch back, and how many resends to try before treating it as failed.
+@Field static final Integer CAT_VERIFY_DELAY_SEC = 8
+@Field static final Integer CAT_VERIFY_MAX_RETRIES = 2
+@Field static final Integer CAT_OFF_RETRY_SEC = 60
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -1067,6 +1088,20 @@ def contactHandler(evt) {
             }
         } else if (state.phase == "CYCLING") {
             clearTimer("confirmHome")
+        } else if (state.phase in ["WAIT", "PULSE", "REASSERT"]) {
+            // The drum is turning although the robot was never (successfully)
+            // triggered by this app. Require every contact so one chattering
+            // sensor can't abort the wait, whatever rotationDetect says.
+            // Opens must also land close together: a long WAIT could otherwise
+            // add up unrelated stray events hours apart into "all contacts".
+            if (!state.openedContacts || (now() - (state.unexpectedOpenStart ?: 0L)) > 300000L) {
+                state.openedContacts = []
+                state.unexpectedOpenStart = now()
+            }
+            noteContactOpened(evt.device.id as String)
+            if ((state.openedContacts?.size() ?: 0) >= drumContacts.size()) {
+                runIn(1, "confirmUnexpectedRotation", [overwrite: true])
+            }
         }
         return
     }
@@ -1090,6 +1125,27 @@ def confirmRotationDetected() {
     clearTimer("rotateTimeout")
     setPhase("CYCLING")
     scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
+}
+
+// The drum rotated while the app was still in WAIT/PULSE/REASSERT: the robot
+// cycled without the cat-sensor pulse landing (e.g. a command lost to a bad
+// mesh) or someone ran it by hand. Adopt it as the cycle rather than leave the
+// app waiting on a cycle that already happened.
+def confirmUnexpectedRotation() {
+    if (!(state.phase in ["WAIT", "PULSE", "REASSERT"])) return
+    String was = phaseLabel(state.phase)
+    logWarn "Drum rotated during ${was} -- robot cycled without the expected pulse; tracking it as the cycle"
+    addHistory("Drum rotated during ${was}; treating as the cycle")
+    ["waitElapsed", "holdCapReached", "pulseDone", "reassertPulseDone",
+     "rotateTimeout", "retryPulseDone"].each { clearTimer(it) }
+    state.deferStarted = null
+    state.deferredReason = null
+    setCatSensor(false)
+    setPhase("CYCLING")
+    scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
+    // The drum may already be back home, in which case no further "closed"
+    // event will arrive to start the home debounce.
+    if (drumIsHome()) scheduleTimer((homeDebounceSec ?: 30) as int, "confirmHome")
 }
 
 def enableSwitchHandler(evt) {
@@ -1236,7 +1292,7 @@ def rotateTimeout() {
         enterWait()
     } else {
         logInfo "Retrying release (attempt ${state.attempts + 1})"
-        catSensorRemote.on()
+        setCatSensor(true)
         scheduleTimer((retryPulseSec ?: 5) as int, "retryPulseDone")
     }
 }
@@ -1311,6 +1367,7 @@ private enterWait() {
     clearTimer("waitElapsed")
     clearTimer("rotateTimeout")
     clearTimer("retryPulseDone")
+    state.openedContacts = []
 
     // Hard cap on the wait phase, re-armed each time we enter it.
     scheduleTimer(((maxHoldMinutes ?: 45) as int) * 60, "holdCapReached")
@@ -1328,7 +1385,7 @@ private beginPulse() {
     clearTimer("holdCapReached")
 
     setPhase("PULSE")
-    catSensorRemote.on()
+    setCatSensor(true)
     scheduleTimer((initialPulseSec ?: 60) as int, "pulseDone")
     logInfo "Wait complete -- pulsing cat sensor for ${initialPulseSec ?: 60}s"
 }
@@ -1336,7 +1393,8 @@ private beginPulse() {
 private enterReassert() {
     setPhase("REASSERT")
     clearTimer("rotateTimeout")
-    catSensorRemote.on()
+    state.openedContacts = []
+    setCatSensor(true)
     scheduleTimer((reassertPulseSec ?: 90) as int, "reassertPulseDone")
 }
 
@@ -1345,7 +1403,7 @@ private enterReassert() {
 // reassert pulse all funnel through here.
 private release() {
     state.openedContacts = []
-    catSensorRemote.off()
+    setCatSensor(false)
 
     if (confirmCycle == false) {
         logInfo "Cat sensor released -- cycle confirmation disabled, returning to idle"
@@ -1407,7 +1465,7 @@ private fault(String reason) {
     sequenceDev()?.off()
     dirtyDev()?.off()
     armedDev()?.on()
-    catSensorRemote.off()
+    setCatSensor(false)
     state.attempts = 0
     state.deferredReason = null
     state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
@@ -1438,11 +1496,63 @@ private resetToIdleKeepingRemoteOff() {
     updateLabel()
 }
 
+// Every cat-sensor command goes through here so it can be verified -- the
+// switch is read back shortly after and resent if it didn't take. A lost on()
+// means the robot was never triggered; a lost off() leaves the sensor asserted,
+// which interferes with the robot.
+private void setCatSensor(boolean on) {
+    state.catSensorWant = on ? "on" : "off"
+    state.catSensorRetries = 0
+    if (on) catSensorRemote.on() else catSensorRemote.off()
+    scheduleTimer(CAT_VERIFY_DELAY_SEC, "verifyCatSensor")
+}
+
+def verifyCatSensor() {
+    String want = state.catSensorWant
+    if (!want) return
+    String actual = catSensorRemote.currentValue("switch")
+    if (actual == want) {
+        if (state.catSensorRetries) logInfo "${catSensorRemote.displayName} confirmed ${want} after ${state.catSensorRetries} resend(s)"
+        state.catSensorRetries = 0
+        state.catSensorStuckNotified = false
+        return
+    }
+
+    int tries = ((state.catSensorRetries ?: 0) as int) + 1
+    state.catSensorRetries = tries
+
+    if (want == "on") {
+        if (tries <= CAT_VERIFY_MAX_RETRIES) {
+            logWarn "${catSensorRemote.displayName} still reads ${actual} after on() -- resending (${tries}/${CAT_VERIFY_MAX_RETRIES})"
+            catSensorRemote.on()
+            scheduleTimer(CAT_VERIFY_DELAY_SEC, "verifyCatSensor")
+        } else if (state.phase in ["PULSE", "REASSERT", "COUNTDOWN"]) {
+            state.catSensorWant = null
+            fault("Cat sensor ${catSensorRemote.displayName} did not turn on after ${tries} attempts " +
+                  "-- the robot was never triggered, check the device/mesh")
+        } else {
+            state.catSensorWant = null
+            logWarn "${catSensorRemote.displayName} never confirmed on"
+        }
+        return
+    }
+
+    // want == "off": a sensor stuck on is worse than a failed pulse, so keep trying.
+    logWarn "${catSensorRemote.displayName} still reads ${actual} after off() -- resending (attempt ${tries})"
+    catSensorRemote.off()
+    if (tries > CAT_VERIFY_MAX_RETRIES && !state.catSensorStuckNotified) {
+        state.catSensorStuckNotified = true
+        sendNotif "Litter Robot: ${catSensorRemote.displayName} did not turn off after ${tries} attempts " +
+                  "-- it may be stuck ON. Still retrying."
+    }
+    scheduleTimer(tries > CAT_VERIFY_MAX_RETRIES ? CAT_OFF_RETRY_SEC : CAT_VERIFY_DELAY_SEC, "verifyCatSensor")
+}
+
 private applyIdleOutputs() {
     armedDev()?.on()
     sequenceDev()?.off()
     dirtyDev()?.off()
-    catSensorRemote.off()
+    setCatSensor(false)
     updateStatusLight()
 }
 
@@ -1564,7 +1674,7 @@ private void stopFaultBlink() {
 
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
-     "reassertPulseDone", "confirmRotationDetected", "confirmHome", "confirmFaultRecoveryHome",
+     "reassertPulseDone", "confirmRotationDetected", "confirmUnexpectedRotation", "confirmHome", "confirmFaultRecoveryHome",
      "cycleTimeout", "watchdog", "statusLightOff"].each { clearTimer(it) }
     stopFaultBlink()
 }

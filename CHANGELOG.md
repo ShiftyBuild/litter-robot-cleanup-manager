@@ -4,6 +4,25 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.5.0
+Two guards against a flaky cat-sensor switch (device commands were
+failing "after 5 retries" on a degraded Zigbee mesh).
+
+1. Every cat-sensor on()/off() is now verified. The switch is read back
+   CAT_VERIFY_DELAY_SEC (8s) later and the command resent up to
+   CAT_VERIFY_MAX_RETRIES (2) times. If an on() never takes, the robot was
+   never triggered, so the app faults right away with a specific reason
+   instead of waiting out several rotate-timeout retries. If an off() never
+   takes (sensor stuck ON, which interferes with the robot), it notifies once
+   and keeps retrying every CAT_OFF_RETRY_SEC (60s). The 5s no-rotation retry
+   pulse is too short to verify, so it is not.
+2. A full drum rotation seen in WAIT, PULSE or REASSERT -- the robot cycled
+   without the app's pulse landing, or was cycled by hand -- is now adopted
+   as the cycle (goes to CYCLING and finishes through the normal home-confirm
+   path) instead of being ignored, which used to strand the app in WAIT.
+   Requires every drum contact to open within 5 minutes, regardless of
+   rotationDetect, so one chattering sensor can't trigger it.
+
 ## 2.4.1
 Fixed the v2.3.0 fault auto-recovery clearing the fault too early.
 It trusted the first "closed" event on a drum contact, but the
