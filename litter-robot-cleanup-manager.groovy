@@ -32,11 +32,12 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.6.1  Robot-timing countdown default corrected from 20 to 15 minutes.
  *  2.6.0  New "Let the Litter-Robot handle the timing" switch (Behavior options,
  *         default off -- nothing changes unless it is turned on). On motion the
  *         cat sensor is pulsed right away for the initial pulse length (60s)
  *         instead of waiting out the WAIT window, then the app waits
- *         robotTimingMinutes (default 20) for the drum to rotate. Motion
+ *         robotTimingMinutes (default 15) for the drum to rotate. Motion
  *         during that countdown always fires another pulse (the "reassert on
  *         countdown" toggle is ignored in this mode), and motion during a
  *         pulse extends it, capped at PULSE_CAP_SEC (90s) total so the sensor
@@ -94,7 +95,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.6.0"
+@Field static final String APP_VERSION = "2.6.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -484,7 +485,7 @@ def optionsPage() {
                 defaultValue: false
             input "robotTimingMinutes", "number",
                 title: "Wait for the robot's cycle (minutes)",
-                defaultValue: 20, required: true, range: "1..120"
+                defaultValue: 15, required: true, range: "1..120"
             paragraph "<small>On: motion pulses the cat sensor immediately (pulse length is under Timing, " +
                       "default 60s), then the app waits this long for the drum to rotate -- the robot's " +
                       "own timer does the waiting. Motion during the pulse extends it (never past " +
@@ -616,7 +617,7 @@ private timingSummary() {
 
 private optionsSummary() {
     def bits = []
-    if (robotTimingMode == true) bits << "robot timing (${robotTimingMinutes ?: 20} min)"
+    if (robotTimingMode == true) bits << "robot timing (${robotTimingMinutes ?: 15} min)"
     bits << ((confirmCycle == false) ? "no cycle confirmation" : "confirm cycle")
     bits << "rotation: ${rotationDetect ?: 'any'} · home: ${homeDetect ?: 'all'}"
     if (reassertOnCountdown == false) bits << "no countdown re-assert"
@@ -1467,7 +1468,7 @@ private void extendPulse() {
 }
 
 private int countdownSec() {
-    return robotTimingMode == true ? (((robotTimingMinutes ?: 20) as int) * 60) : ((rotateTimeoutSec ?: 540) as int)
+    return robotTimingMode == true ? (((robotTimingMinutes ?: 15) as int) * 60) : ((rotateTimeoutSec ?: 540) as int)
 }
 
 // Called whenever a cat-sensor pulse legitimately ends and control passes back

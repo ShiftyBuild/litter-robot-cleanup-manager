@@ -4,13 +4,18 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.6.1
+Robot-timing countdown default corrected from 20 to 15 minutes (the
+`robotTimingMinutes` input default and its fallbacks). If 2.6.0 was already
+saved with the switch on, the stored 20 stays until changed on the page.
+
 ## 2.6.0
 New "Let the Litter-Robot handle the timing" switch on Behavior options
 (`robotTimingMode`, default off -- nothing changes unless turned on).
 
 - On motion, the cat sensor is pulsed right away for the initial pulse
   length (60s) instead of waiting out the WAIT window.
-- The app then waits `robotTimingMinutes` (default 20) for the drum to
+- The app then waits `robotTimingMinutes` (default 15) for the drum to
   rotate; the robot's own timer does the waiting.
 - Motion during that wait always fires another pulse (the "reassert on
   countdown" toggle is ignored in this mode). Motion during a pulse extends
