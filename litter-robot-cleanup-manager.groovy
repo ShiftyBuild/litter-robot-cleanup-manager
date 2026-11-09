@@ -32,6 +32,11 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.6.2  Robot-timing wait is now a 3 / 7 / 15 minute choice (the robot's own
+ *         Clean Cycle Wait Time options, default 15) rather than free entry, and
+ *         the app waits that long plus ROBOT_TIMING_MARGIN_SEC (2 min) before
+ *         calling a missed cycle, so it can't race a drum that starts right at
+ *         the robot's own timer.
  *  2.6.1  Robot-timing countdown default corrected from 20 to 15 minutes.
  *  2.6.0  New "Let the Litter-Robot handle the timing" switch (Behavior options,
  *         default off -- nothing changes unless it is turned on). On motion the
@@ -95,7 +100,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.6.1"
+@Field static final String APP_VERSION = "2.6.2"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -140,6 +145,11 @@ import groovy.transform.Field
 // Hard ceiling on how long one run of the cat sensor may stay asserted, even
 // when motion keeps extending a pulse in robot-timing mode.
 @Field static final Integer PULSE_CAP_SEC = 90
+
+// Robot-timing mode waits the robot's own Clean Cycle Wait Time plus this
+// margin before calling a missed cycle -- the drum was observed starting ~4s
+// after a 7-minute wait, so waiting exactly that long would race it.
+@Field static final Integer ROBOT_TIMING_MARGIN_SEC = 120
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -483,12 +493,14 @@ def optionsPage() {
             input "robotTimingMode", "bool",
                 title: "Let the Litter-Robot handle the timing",
                 defaultValue: false
-            input "robotTimingMinutes", "number",
-                title: "Wait for the robot's cycle (minutes)",
-                defaultValue: 15, required: true, range: "1..120"
+            input "robotTimingMinutes", "enum",
+                title: "Robot's Clean Cycle Wait Time",
+                options: ["3": "3 minutes", "7": "7 minutes", "15": "15 minutes"],
+                defaultValue: "15", required: true
             paragraph "<small>On: motion pulses the cat sensor immediately (pulse length is under Timing, " +
-                      "default 60s), then the app waits this long for the drum to rotate -- the robot's " +
-                      "own timer does the waiting. Motion during the pulse extends it (never past " +
+                      "default 60s), then the app waits for the drum to rotate -- the robot's own " +
+                      "timer does the waiting. Set this to match the Clean Cycle Wait Time configured on the " +
+                      "robot itself; the app adds ${ROBOT_TIMING_MARGIN_SEC / 60} min of margin before calling a missed cycle. Motion during the pulse extends it (never past " +
                       "${PULSE_CAP_SEC}s total); motion during the wait pulses again. The WAIT window " +
                       "and \"Release \u2192 rotation\" are not used. Quiet hours / disallowed modes still " +
                       "use the normal wait flow. Off: the app's own wait-then-pulse timing.</small>"
@@ -1468,7 +1480,7 @@ private void extendPulse() {
 }
 
 private int countdownSec() {
-    return robotTimingMode == true ? (((robotTimingMinutes ?: 15) as int) * 60) : ((rotateTimeoutSec ?: 540) as int)
+    return robotTimingMode == true ? ((((robotTimingMinutes ?: 15) as int) * 60) + ROBOT_TIMING_MARGIN_SEC) : ((rotateTimeoutSec ?: 540) as int)
 }
 
 // Called whenever a cat-sensor pulse legitimately ends and control passes back

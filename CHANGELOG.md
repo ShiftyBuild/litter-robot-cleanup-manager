@@ -4,6 +4,14 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.6.2
+Robot-timing wait is now a 3 / 7 / 15 minute choice (the robot's own Clean
+Cycle Wait Time options, default 15) instead of free entry. The app waits
+that long plus ROBOT_TIMING_MARGIN_SEC (2 min) before calling a missed cycle,
+so it can't race a drum that starts right at the robot's own timer (observed
+starting ~4s after a 7-minute wait). A previously saved free-entry value
+still works until the setting is re-saved on the page.
+
 ## 2.6.1
 Robot-timing countdown default corrected from 20 to 15 minutes (the
 `robotTimingMinutes` input default and its fallbacks). If 2.6.0 was already
