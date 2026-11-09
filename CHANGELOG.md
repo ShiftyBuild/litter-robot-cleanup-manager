@@ -4,6 +4,23 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.6.0
+New "Let the Litter-Robot handle the timing" switch on Behavior options
+(`robotTimingMode`, default off -- nothing changes unless turned on).
+
+- On motion, the cat sensor is pulsed right away for the initial pulse
+  length (60s) instead of waiting out the WAIT window.
+- The app then waits `robotTimingMinutes` (default 20) for the drum to
+  rotate; the robot's own timer does the waiting.
+- Motion during that wait always fires another pulse (the "reassert on
+  countdown" toggle is ignored in this mode). Motion during a pulse extends
+  it, capped at PULSE_CAP_SEC (90s) from its start so the sensor is never
+  held. Pulses in this mode are all the initial pulse length.
+- Drum-contact handling (rotation, home, cycle timeout, faults, the v2.5.0
+  unexpected-rotation adoption) is unchanged.
+- Quiet hours / disallowed modes still fall back to the normal WAIT flow so
+  skip/defer keep working. The estimated cycle time accounts for the mode.
+
 ## 2.5.0
 Two guards against a flaky cat-sensor switch (device commands were
 failing "after 5 retries" on a degraded Zigbee mesh).

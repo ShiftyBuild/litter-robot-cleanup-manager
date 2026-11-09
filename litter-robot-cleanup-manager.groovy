@@ -32,6 +32,17 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.6.0  New "Let the Litter-Robot handle the timing" switch (Behavior options,
+ *         default off -- nothing changes unless it is turned on). On motion the
+ *         cat sensor is pulsed right away for the initial pulse length (60s)
+ *         instead of waiting out the WAIT window, then the app waits
+ *         robotTimingMinutes (default 20) for the drum to rotate. Motion
+ *         during that countdown always fires another pulse (the "reassert on
+ *         countdown" toggle is ignored in this mode), and motion during a
+ *         pulse extends it, capped at PULSE_CAP_SEC (90s) total so the sensor
+ *         is never held. Drum-contact handling (rotation, home, faults) is
+ *         untouched. Quiet hours / disallowed modes still fall back to the
+ *         normal WAIT flow so skip/defer keep working.
  *  2.5.0  Two guards against a flaky cat-sensor switch (device commands were
  *         failing "after 5 retries" on a degraded Zigbee mesh).
  *         (1) Every cat-sensor on()/off() is now verified: the switch is read
@@ -83,7 +94,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.5.0"
+@Field static final String APP_VERSION = "2.6.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -124,6 +135,10 @@ import groovy.transform.Field
 @Field static final Integer CAT_VERIFY_DELAY_SEC = 8
 @Field static final Integer CAT_VERIFY_MAX_RETRIES = 2
 @Field static final Integer CAT_OFF_RETRY_SEC = 60
+
+// Hard ceiling on how long one run of the cat sensor may stay asserted, even
+// when motion keeps extending a pulse in robot-timing mode.
+@Field static final Integer PULSE_CAP_SEC = 90
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -463,6 +478,21 @@ private void resetTimingDefaults() {
 def optionsPage() {
     dynamicPage(name: "optionsPage", title: "Behavior options") {
 
+        section("Who handles the timing") {
+            input "robotTimingMode", "bool",
+                title: "Let the Litter-Robot handle the timing",
+                defaultValue: false
+            input "robotTimingMinutes", "number",
+                title: "Wait for the robot's cycle (minutes)",
+                defaultValue: 20, required: true, range: "1..120"
+            paragraph "<small>On: motion pulses the cat sensor immediately (pulse length is under Timing, " +
+                      "default 60s), then the app waits this long for the drum to rotate -- the robot's " +
+                      "own timer does the waiting. Motion during the pulse extends it (never past " +
+                      "${PULSE_CAP_SEC}s total); motion during the wait pulses again. The WAIT window " +
+                      "and \"Release \u2192 rotation\" are not used. Quiet hours / disallowed modes still " +
+                      "use the normal wait flow. Off: the app's own wait-then-pulse timing.</small>"
+        }
+
         section("Contact sensor logic") {
             input "rotationDetect", "enum",
                 title: "Count rotation as started when...",
@@ -586,6 +616,7 @@ private timingSummary() {
 
 private optionsSummary() {
     def bits = []
+    if (robotTimingMode == true) bits << "robot timing (${robotTimingMinutes ?: 20} min)"
     bits << ((confirmCycle == false) ? "no cycle confirmation" : "confirm cycle")
     bits << "rotation: ${rotationDetect ?: 'any'} · home: ${homeDetect ?: 'all'}"
     if (reassertOnCountdown == false) bits << "no countdown re-assert"
@@ -698,8 +729,11 @@ private Integer avgCycleDurationSec() {
 // full wait window, the initial pulse, and the robot's own release-to-home
 // timing budget.
 private Integer configuredCycleEstimateSec() {
-    if (!waitMinutes || !initialPulseSec || !rotateTimeoutSec || !cycleTimeoutSec) return null
-    return ((waitMinutes as int) * 60) + (initialPulseSec as int) + (rotateTimeoutSec as int) +
+    if (!initialPulseSec || !cycleTimeoutSec) return null
+    // Robot-timing mode has no WAIT window, and its countdown is its own setting.
+    if (robotTimingMode != true && (!waitMinutes || !rotateTimeoutSec)) return null
+    int waitSec = robotTimingMode == true ? 0 : ((waitMinutes as int) * 60)
+    return waitSec + (initialPulseSec as int) + countdownSec() +
            (cycleTimeoutSec as int) + ((homeDebounceSec ?: 0) as int)
 }
 
@@ -996,6 +1030,10 @@ def motionHandler(evt) {
                 break
 
             case "PULSE":
+                if (robotTimingMode == true) {
+                    extendPulse()
+                    break
+                }
                 // The pulse is a short, fixed commitment -- extending it risks holding
                 // the sensor past what the robot's hardware tolerates. Noted, not acted
                 // on: if the cat is still there once it ends, the rotateTimeout retry
@@ -1004,16 +1042,20 @@ def motionHandler(evt) {
                 break
 
             case "COUNTDOWN":
-                if (reassertOnCountdown == false) {
+                if (reassertOnCountdown == false && robotTimingMode != true) {
                     logDebug "Motion during countdown -- reassert disabled by config, ignoring"
                     return
                 }
                 logInfo "Cat returned during robot countdown -- firing reassert pulse"
-                addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseSec}s")
+                addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseLen()}s")
                 enterReassert()
                 break
 
             case "REASSERT":
+                if (robotTimingMode == true) {
+                    extendPulse()
+                    break
+                }
                 // Same reasoning as PULSE: let the fixed pulse finish rather than
                 // extend it.
                 logDebug "Motion during reassert pulse -- noted, pulse continues to completion"
@@ -1275,8 +1317,8 @@ def rotateTimeout() {
     if (state.phase != "COUNTDOWN") return
 
     state.attempts = (state.attempts ?: 0) + 1
-    logWarn "Drum did not start moving within ${rotateTimeoutSec}s (attempt ${state.attempts})"
-    addHistory("No rotation within ${rotateTimeoutSec}s (attempt ${state.attempts})")
+    logWarn "Drum did not start moving within ${countdownSec()}s (attempt ${state.attempts})"
+    addHistory("No rotation within ${countdownSec()}s (attempt ${state.attempts})")
 
     if (retryEnabled == false) {
         fault("Robot did not begin a cycle and retries are disabled")
@@ -1287,7 +1329,7 @@ def rotateTimeout() {
         return
     }
 
-    if (motionSensor.currentValue("motion") == "active") {
+    if (motionSensor.currentValue("motion") == "active" && robotTimingMode != true) {
         logInfo "Retrying, but motion is active -- waiting for it to clear"
         enterWait()
     } else {
@@ -1358,7 +1400,12 @@ private startSequence() {
 
     // Cat sensor stays OFF here -- WAIT never asserts it, only PULSE/REASSERT do.
     scheduleTimer(((watchdogMinutes ?: 90) as int) * 60, "watchdog")
-    enterWait()
+    if (robotTimingMode == true && !releaseBlockedReason()) {
+        logInfo "Robot-timing mode -- pulsing the cat sensor right away"
+        beginPulse()
+    } else {
+        enterWait()
+    }
 }
 
 private enterWait() {
@@ -1385,17 +1432,42 @@ private beginPulse() {
     clearTimer("holdCapReached")
 
     setPhase("PULSE")
+    state.pulseStarted = now()
     setCatSensor(true)
     scheduleTimer((initialPulseSec ?: 60) as int, "pulseDone")
-    logInfo "Wait complete -- pulsing cat sensor for ${initialPulseSec ?: 60}s"
+    logInfo "Pulsing cat sensor for ${initialPulseSec ?: 60}s"
 }
 
 private enterReassert() {
     setPhase("REASSERT")
     clearTimer("rotateTimeout")
     state.openedContacts = []
+    state.pulseStarted = now()
     setCatSensor(true)
-    scheduleTimer((reassertPulseSec ?: 90) as int, "reassertPulseDone")
+    scheduleTimer(reassertPulseLen(), "reassertPulseDone")
+}
+
+// Robot-timing mode pulses the same length every time; the normal flow keeps
+// its separate (longer) reassert length.
+private int reassertPulseLen() {
+    return robotTimingMode == true ? ((initialPulseSec ?: 60) as int) : ((reassertPulseSec ?: 90) as int)
+}
+
+// Robot-timing mode only: motion while the sensor is already on pushes the
+// pulse's end out by another full pulse length, but never past PULSE_CAP_SEC
+// since it started -- holding the sensor continuously interferes with the robot.
+private void extendPulse() {
+    boolean initial = (state.phase == "PULSE")
+    int baseSec = initial ? ((initialPulseSec ?: 60) as int) : reassertPulseLen()
+    long capMs = ((state.pulseStarted ?: now()) as long) + (PULSE_CAP_SEC * 1000L)
+    long untilMs = Math.min(now() + (baseSec * 1000L), capMs)
+    int secs = Math.max(((untilMs - now()) / 1000) as int, 1)
+    scheduleTimer(secs, initial ? "pulseDone" : "reassertPulseDone")
+    logDebug "Motion during pulse -- pulse now ends in ${secs}s (cap ${PULSE_CAP_SEC}s from start)"
+}
+
+private int countdownSec() {
+    return robotTimingMode == true ? (((robotTimingMinutes ?: 20) as int) * 60) : ((rotateTimeoutSec ?: 540) as int)
 }
 
 // Called whenever a cat-sensor pulse legitimately ends and control passes back
@@ -1414,7 +1486,7 @@ private release() {
     }
 
     setPhase("COUNTDOWN")
-    scheduleTimer((rotateTimeoutSec ?: 540) as int, "rotateTimeout")
+    scheduleTimer(countdownSec(), "rotateTimeout")
     logInfo "Cat sensor released -- robot's timer running, watching for rotation"
 }
 
