@@ -4,6 +4,14 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.6.4
+Fault auto-recovery now sets the post-cycle cooldown (`cooldownSec`), the
+same as a normal completed cycle. `faultRecoveryComplete()` was the one
+cycle-completion path that skipped it, so after a manual clean cycle on the
+robot the app started a new sequence on the next motion (observed 2026-11-12:
+manual cycle cleared the fault at 08:54:45, motion at 09:03:07 started a
+sequence even with the cooldown at 600s).
+
 ## 2.6.3
 Every motion sensor event (active and inactive) is now logged at info level
 as `Motion sensor <value> (phase X[, cooldown Ns left][, fault active])`.

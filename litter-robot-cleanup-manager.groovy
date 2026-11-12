@@ -32,6 +32,10 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.6.4  Fault auto-recovery (a manual clean cycle on the robot clearing a fault)
+ *         now starts the post-cycle cooldown like a normal completed cycle does.
+ *         Before, motion a few minutes after a manual cycle started a new
+ *         sequence straight away.
  *  2.6.3  Every motion sensor event (active and inactive) is now logged at info
  *         level with the current phase, cooldown remaining and fault state, so
  *         false-motion patterns around cycles can be reviewed in the app log.
@@ -103,7 +107,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.6.3"
+@Field static final String APP_VERSION = "2.6.4"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -977,6 +981,9 @@ private void performManualReset(String source) {
     state.lastFaultReason = null
     state.faultRecoveryContacts = []
     state.statusLightBoosted = true
+    // Same post-cycle cooldown a normal completed cycle gets -- the drum just
+    // finished rotating, and the motion sensor tends to fire in the minutes after.
+    state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
     resetToIdle()
 }
 
