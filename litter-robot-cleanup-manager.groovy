@@ -32,6 +32,9 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.6.3  Every motion sensor event (active and inactive) is now logged at info
+ *         level with the current phase, cooldown remaining and fault state, so
+ *         false-motion patterns around cycles can be reviewed in the app log.
  *  2.6.2  Robot-timing wait is now a 3 / 7 / 15 minute choice (the robot's own
  *         Clean Cycle Wait Time options, default 15) rather than free entry, and
  *         the app waits that long plus ROBOT_TIMING_MARGIN_SEC (2 min) before
@@ -100,7 +103,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.6.2"
+@Field static final String APP_VERSION = "2.6.3"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -1008,6 +1011,12 @@ def resetButtonHandler(evt) {
 
 def motionHandler(evt) {
     logDebug "motion ${evt.value} (phase ${state.phase})"
+    // Info-level record of every raw motion event (not just ones that act), so the
+    // sensor's active/inactive pattern around cycles can be reviewed in the app log.
+    String ctx = "phase ${state.phase}"
+    if (inCooldown()) ctx += ", cooldown ${((state.cooldownUntil - now()) / 1000) as int}s left"
+    if (faultActive()) ctx += ", fault active"
+    logInfo "Motion sensor ${evt.value} (${ctx})"
 
     if (evt.value == "active") {
         switch (state.phase) {

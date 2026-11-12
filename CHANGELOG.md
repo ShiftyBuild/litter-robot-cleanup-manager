@@ -4,6 +4,12 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.6.3
+Every motion sensor event (active and inactive) is now logged at info level
+as `Motion sensor <value> (phase X[, cooldown Ns left][, fault active])`.
+Previously only debug logging and the events that acted were visible, which
+made false-motion patterns around cycle ends hard to review.
+
 ## 2.6.2
 Robot-timing wait is now a 3 / 7 / 15 minute choice (the robot's own Clean
 Cycle Wait Time options, default 15) instead of free entry. The app waits
