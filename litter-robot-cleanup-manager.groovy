@@ -32,6 +32,15 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.7.0  Status light colors are now configurable per step. New "Status light
+ *         colors" page (main page, Configuration) with one color choice each
+ *         for CLEAN, WAIT, PULSE, REASSERT, LR-TIMER, CYCLING and the flashing
+ *         fault indicator, from a standard list (red, orange, yellow, green,
+ *         cyan, blue, purple, pink, white). Every step except the fault can
+ *         also be set to "light off". Defaults match the previous fixed
+ *         colors, so nothing changes until a color is picked. Brightness,
+ *         the reset boost and auto-off still follow the CLEAN step, whatever
+ *         color it uses.
  *  2.6.4  Fault auto-recovery (a manual clean cycle on the robot clearing a fault)
  *         now starts the post-cycle cooldown like a normal completed cycle does.
  *         Before, motion a few minutes after a manual cycle started a new
@@ -107,7 +116,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.6.4"
+@Field static final String APP_VERSION = "2.7.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -127,10 +136,42 @@ import groovy.transform.Field
 // Level is deliberately left out here -- it comes from the configurable
 // statusLightLevel setting instead, applied in updateStatusLight().
 @Field static final Map STATUS_COLORS = [
-    green:  [hue: 33, saturation: 100],
-    yellow: [hue: 16, saturation: 100],
-    orange: [hue: 8,  saturation: 100],
     red:    [hue: 0,  saturation: 100],
+    orange: [hue: 8,  saturation: 100],
+    yellow: [hue: 16, saturation: 100],
+    green:  [hue: 33, saturation: 100],
+    cyan:   [hue: 50, saturation: 100],
+    blue:   [hue: 66, saturation: 100],
+    purple: [hue: 75, saturation: 100],
+    pink:   [hue: 91, saturation: 100],
+    white:  [hue: 0,  saturation: 0],
+]
+
+// Choices offered on the Status light colors page. "off" is not a color in
+// STATUS_COLORS -- it means the light is turned off for that step.
+@Field static final Map STATUS_COLOR_OPTIONS = [
+    red: "Red", orange: "Orange", yellow: "Yellow", green: "Green", cyan: "Cyan",
+    blue: "Blue", purple: "Purple", pink: "Pink", white: "White",
+]
+
+// One configurable color per step of the process. key is the state.phase value
+// (FAULT is not a phase -- it is the flashing indicator that overrides them all);
+// dflt is the color that step had before the colors became configurable.
+@Field static final List LIGHT_STEPS = [
+    [key: "IDLE",      setting: "lightColorIdle",      dflt: "green",
+     label: "CLEAN — idle, nothing in progress"],
+    [key: "WAIT",      setting: "lightColorWait",      dflt: "orange",
+     label: "WAIT — motion seen, waiting for the box to stay quiet"],
+    [key: "PULSE",     setting: "lightColorPulse",     dflt: "red",
+     label: "PULSE — cat sensor is being pulsed"],
+    [key: "REASSERT",  setting: "lightColorReassert",  dflt: "red",
+     label: "REASSERT — cat sensor pulsed again after motion during LR-TIMER"],
+    [key: "COUNTDOWN", setting: "lightColorCountdown", dflt: "yellow",
+     label: "LR-TIMER — robot's own timer is running"],
+    [key: "CYCLING",   setting: "lightColorCycling",   dflt: "yellow",
+     label: "CYCLING — drum is rotating"],
+    [key: "FAULT",     setting: "lightColorFault",     dflt: "red",
+     label: "Fault — flashes this color until the fault is cleared"],
 ]
 
 // How often the fault indicator alternates between red and off, in seconds.
@@ -176,6 +217,7 @@ preferences {
     page(name: "devicePage")
     page(name: "timingPage")
     page(name: "optionsPage")
+    page(name: "lightPage")
     page(name: "restrictionPage")
     page(name: "historyPage")
 }
@@ -208,6 +250,10 @@ def mainPage() {
                 title: "Behavior options",
                 description: optionsSummary(),
                 state: "complete"
+            href name: "hrefLight", page: "lightPage",
+                title: "Status light colors",
+                description: lightSummary(),
+                state: statusLight ? "complete" : null
             href name: "hrefRestrictions", page: "restrictionPage",
                 title: "Restrictions",
                 description: restrictionSummary(),
@@ -300,12 +346,12 @@ def devicePage() {
 
         section("Optional — status light") {
             input "statusLight", "capability.colorControl",
-                title: "Notification light — green idle, orange while waiting for the box to be " +
-                        "quiet, red only while the cat sensor is actively pulsed, yellow while the " +
-                        "robot's own timer/cycle is running, flashing red on an unresolved fault",
+                title: "Notification light — shows which step the process is in, and flashes " +
+                        "on an unresolved fault",
                 required: false
             paragraph "<small>Any color bulb works. The app turns it on and sets its color on " +
-                      "every phase change. Leave blank to skip.</small>"
+                      "every phase change. The color for each step is set on the Status light " +
+                      "colors page (main page, Configuration). Leave blank to skip.</small>"
             input "statusLightLevel", "number",
                 title: "Brightness (%)",
                 defaultValue: 100, required: true, range: "1..100"
@@ -554,6 +600,36 @@ def optionsPage() {
 }
 
 // ============================================================================
+//  Page: status light colors
+// ============================================================================
+
+def lightPage() {
+    dynamicPage(name: "lightPage", title: "Status light colors") {
+
+        if (!statusLight) {
+            section {
+                paragraph "No status light is selected yet. Pick one under Devices " +
+                          "(Optional — status light); these colors apply once it is set."
+            }
+        }
+
+        section("Color for each step") {
+            LIGHT_STEPS.each { step ->
+                // The fault indicator flashes, so "off" would make it invisible.
+                def opts = step.key == "FAULT" ? STATUS_COLOR_OPTIONS
+                                               : STATUS_COLOR_OPTIONS + [off: "Light off"]
+                input step.setting, "enum",
+                    title: step.label,
+                    options: opts, defaultValue: step.dflt, required: true
+            }
+            paragraph "<small>Changes apply when you press Done on the main page. Brightness " +
+                      "and the idle auto-off timer are under Devices (Optional — status " +
+                      "light); auto-off applies to the CLEAN step whatever color it uses.</small>"
+        }
+    }
+}
+
+// ============================================================================
 //  Page: restrictions
 // ============================================================================
 
@@ -642,6 +718,14 @@ private optionsSummary() {
     if (reassertOnCountdown == false) bits << "no countdown re-assert"
     if (retryEnabled == false) bits << "no retries"
     return bits.join(" · ")
+}
+
+private lightSummary() {
+    if (!statusLight) return "No status light selected"
+    return LIGHT_STEPS.collect { step ->
+        def c = stepColor(step.key)
+        "${step.key == 'FAULT' ? 'fault' : phaseLabel(step.key)}: ${c == 'off' ? 'off' : STATUS_COLOR_OPTIONS[c].toLowerCase()}"
+    }.join(" · ")
 }
 
 private restrictionSummary() {
@@ -1669,12 +1753,20 @@ private setPhase(String p) {
     updateStatusLight()
 }
 
-// Green: idle and no unresolved fault. Orange: waiting for the box to go and
-// stay quiet, nothing asserted yet. Red: the cat sensor is actively pulsed
-// right now (initial pulse or a mid-countdown reassert) -- reserved for that
-// specific condition. Yellow: the robot's own countdown or cycle is running,
-// out of the app's hands. Flashing red: an unresolved fault, which overrides
-// every other state so it can never be mistaken for a normal pulse.
+// The configured color for one step (a state.phase value, or "FAULT"), falling
+// back to that step's default when the setting is unset or not a known color --
+// a code-only paste leaves new settings null until their page is saved. Returns
+// "off" when the step is set to turn the light off (never for the fault).
+private String stepColor(String stepKey) {
+    def step = LIGHT_STEPS.find { it.key == stepKey } ?: LIGHT_STEPS[0]
+    String c = settings[step.setting] ?: step.dflt
+    if (c == "off") return step.key == "FAULT" ? step.dflt : "off"
+    return STATUS_COLORS.containsKey(c) ? c : step.dflt
+}
+
+// Shows the configured color for the current step (see LIGHT_STEPS for the
+// defaults). An unresolved fault overrides every step with a flashing color so
+// it can never be mistaken for a normal phase.
 private void updateStatusLight() {
     if (!statusLight) return
 
@@ -1684,36 +1776,34 @@ private void updateStatusLight() {
     }
     stopFaultBlink()
 
-    String color
-    switch (state.phase) {
-        case "WAIT":                color = "orange"; break
-        case "PULSE":
-        case "REASSERT":            color = "red";    break
-        case "COUNTDOWN":
-        case "CYCLING":             color = "yellow"; break
-        default:                    color = "green"
-    }
+    // Anything that is not a sequence phase counts as idle, as before.
+    boolean idle = !(state.phase in ["WAIT", "PULSE", "REASSERT", "COUNTDOWN", "CYCLING"])
+    String color = stepColor(idle ? "IDLE" : state.phase)
 
     // The reset-notify boost (see performManualReset()/faultRecoveryComplete())
-    // only ever applies to the green/idle color it was set for -- any other
-    // color means the phase has since moved on, so the boost is stale and
+    // only ever applies to the idle step it was set for -- any other step
+    // means the phase has since moved on, so the boost is stale and
     // clears here rather than carrying over into a later idle period.
-    if (color != "green") state.statusLightBoosted = false
+    if (!idle) state.statusLightBoosted = false
     Integer configuredLevel = (statusLightLevel ?: 100) as int
-    Integer level = (color == "green" && state.statusLightBoosted) ?
+    Integer level = (idle && state.statusLightBoosted) ?
         Math.max(configuredLevel, RESET_NOTIFY_LEVEL) : configuredLevel
 
     try {
-        statusLight.on()
-        statusLight.setColor(STATUS_COLORS[color] + [level: level])
+        if (color == "off") {
+            statusLight.off()
+        } else {
+            statusLight.on()
+            statusLight.setColor(STATUS_COLORS[color] + [level: level])
+        }
     } catch (e) {
         logWarn "Could not set status light (${statusLight.displayName}) to ${color}: ${e.message}"
     }
 
-    // Auto-off only ever applies to the green/idle state -- any other color means
+    // Auto-off only ever applies to the idle step -- any other step means
     // there's a pending sequence, active fault, or countdown, so cancel it there.
     def offMin = (statusLightAutoOffMinutes ?: 0) as int
-    if (color == "green" && offMin > 0) {
+    if (idle && color != "off" && offMin > 0) {
         scheduleTimer(offMin * 60, "statusLightOff")
     } else {
         clearTimer("statusLightOff")
@@ -1731,7 +1821,7 @@ def statusLightOff() {
     state.statusLightBoosted = false
 }
 
-// Starts the flashing-red fault indicator if it isn't already running. Cancels
+// Starts the flashing fault indicator if it isn't already running. Cancels
 // any pending auto-off first -- the light must never go dark while faulted.
 // Idempotent: repeated calls while a fault is already blinking are a no-op,
 // so a fault that logs multiple times (e.g. retries) doesn't restart the timing.
@@ -1743,7 +1833,7 @@ private void startFaultBlink() {
     faultBlinkTick()
 }
 
-// Self-rescheduling toggle -- alternates the light between red and off every
+// Self-rescheduling toggle -- alternates the light between the fault color and off every
 // FAULT_BLINK_INTERVAL_SEC while the fault remains active. Stops itself (and
 // restores the correct steady color) the moment the fault clears, even if
 // nothing else happens to call updateStatusLight() in the meantime.
@@ -1757,7 +1847,7 @@ def faultBlinkTick() {
     try {
         if (state.faultBlinkOn) {
             statusLight.on()
-            statusLight.setColor(STATUS_COLORS.red + [level: (statusLightLevel ?: 100) as int])
+            statusLight.setColor(STATUS_COLORS[stepColor("FAULT")] + [level: (statusLightLevel ?: 100) as int])
         } else {
             statusLight.off()
         }

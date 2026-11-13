@@ -4,6 +4,23 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.7.0
+Status light colors are now configurable per step. New "Status light colors"
+page (main page, Configuration) with one color choice each for CLEAN, WAIT,
+PULSE, REASSERT, LR-TIMER, CYCLING and the flashing fault indicator
+(`lightColorIdle`, `lightColorWait`, `lightColorPulse`, `lightColorReassert`,
+`lightColorCountdown`, `lightColorCycling`, `lightColorFault`).
+
+- Choices are a standard list: red, orange, yellow, green, cyan, blue, purple,
+  pink, white. Every step except the fault can also be set to "light off".
+- Defaults match the previous fixed colors (green / orange / red / red /
+  yellow / yellow / flashing red), so nothing changes until a color is picked.
+  PULSE and REASSERT, and LR-TIMER and CYCLING, used to share a color and can
+  now be told apart.
+- Brightness, the reset boost and the idle auto-off timer follow the CLEAN
+  step rather than the color green, so they keep working whatever color CLEAN
+  uses.
+
 ## 2.6.4
 Fault auto-recovery now sets the post-cycle cooldown (`cooldownSec`), the
 same as a normal completed cycle. `faultRecoveryComplete()` was the one
