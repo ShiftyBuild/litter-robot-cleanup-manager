@@ -32,6 +32,15 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.7.3  New "Minimum rotation time" timer (Timing page, The cycle, default
+ *         100s). The drum can't be confirmed home until it has been rotating
+ *         at least this long, on top of the home debounce. Drum Position 2
+ *         sometimes closes ~15-18s into a rotation and stays closed ~70s while
+ *         the drum pauses mid-cycle (4 of 42 recorded rotations); with "count
+ *         the drum as home when ANY contact is closed" the 30s debounce
+ *         finished inside that pause and the app went to CLEAN ~80s before
+ *         the drum got home. Real rotations take 120-129s and the pause ends
+ *         by ~88s, so 100s clears it. Applies to fault auto-recovery too.
  *  2.7.2  Fixed the watchdog resetting to CLEAN while the drum was still
  *         rotating. The watchdog counts from the start of the sequence, so a
  *         long LR-TIMER (many reassert pulses, each restarting the robot's own
@@ -129,7 +138,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.7.2"
+@Field static final String APP_VERSION = "2.7.3"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -498,6 +507,14 @@ def timingPage() {
                 defaultValue: 30, required: true, range: "1..600"
             paragraph "<small>How long the drum must stay at home position to count as returned. " +
                       "This is what makes it a real confirmation rather than a single contact blip.</small>"
+            input "minRotationSec", "number",
+                title: "Minimum rotation time (seconds)",
+                defaultValue: 100, required: true, range: "0..600"
+            paragraph "<small>The drum is never confirmed home until it has been rotating at least " +
+                      "this long, however the contacts read. A full cycle on this robot takes about " +
+                      "2 minutes, and a drum contact can read closed for over a minute while the " +
+                      "drum pauses partway through, which would otherwise pass the home debounce " +
+                      "early. Keep it below the shortest real cycle. 0 turns it off.</small>"
         }
 
         section("Retries and recovery") {
@@ -539,6 +556,7 @@ private void resetTimingDefaults() {
         rotateTimeoutSec: [value: "540", type: "number"],
         cycleTimeoutSec:  [value: "300", type: "number"],
         homeDebounceSec:  [value: "30",  type: "number"],
+        minRotationSec:   [value: "100", type: "number"],
         maxAttempts:      [value: "3",   type: "number"],
         retryPulseSec:    [value: "5",   type: "number"],
         cooldownSec:      [value: "90",  type: "number"],
@@ -1114,6 +1132,7 @@ private void performManualReset(String source) {
     state.lastFault = null
     state.lastFaultReason = null
     state.faultRecoveryContacts = []
+    state.faultRecoveryRotationAt = null
     state.statusLightBoosted = true
     // Same post-cycle cooldown a normal completed cycle gets -- the drum just
     // finished rotating, and the motion sensor tends to fire in the minutes after.
@@ -1133,6 +1152,7 @@ private void faultRecoveryComplete() {
     state.lastFault = null
     state.lastFaultReason = null
     state.faultRecoveryContacts = []
+    state.faultRecoveryRotationAt = null
     state.statusLightBoosted = true
     resetToIdle()
 }
@@ -1266,7 +1286,7 @@ def contactHandler(evt) {
             // minutes before the drum actually finished, in turn letting real
             // motion right after start a normal WAIT cycle instead of settling
             // at CLEAN. Debounce it exactly like confirmHome() does.
-            scheduleTimer((homeDebounceSec ?: 30) as int, "confirmFaultRecoveryHome")
+            scheduleTimer(homeConfirmDelaySec(state.faultRecoveryRotationAt), "confirmFaultRecoveryHome")
         }
         return
     }
@@ -1313,8 +1333,9 @@ def contactHandler(evt) {
 
     // evt.value == "closed"
     if (state.phase == "CYCLING" && drumIsHome()) {
-        scheduleTimer((homeDebounceSec ?: 30) as int, "confirmHome")
-        logDebug "Drum reads home -- confirming in ${homeDebounceSec}s"
+        int delay = homeConfirmDelaySec(state.rotationStartedAt)
+        scheduleTimer(delay, "confirmHome")
+        logDebug "Drum reads home -- confirming in ${delay}s"
     }
 }
 
@@ -1327,6 +1348,8 @@ def confirmRotationDetected() {
         return
     }
     logInfo "Drum rotation detected -- confirming completion"
+    // This job runs 1s after the first contact opened.
+    state.rotationStartedAt = now() - 1000L
     clearTimer("rotateTimeout")
     // The drum is moving now: the whole-sequence watchdog must not cut this
     // short. cycleTimeout covers CYCLING and faults on a real jam.
@@ -1349,6 +1372,7 @@ def confirmUnexpectedRotation() {
     state.deferStarted = null
     state.deferredReason = null
     setCatSensor(false)
+    state.rotationStartedAt = state.unexpectedOpenStart ?: now()
     // The drum is moving now: the whole-sequence watchdog must not cut this
     // short. cycleTimeout covers CYCLING and faults on a real jam.
     clearTimer("watchdog")
@@ -1356,7 +1380,7 @@ def confirmUnexpectedRotation() {
     scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
     // The drum may already be back home, in which case no further "closed"
     // event will arrive to start the home debounce.
-    if (drumIsHome()) scheduleTimer((homeDebounceSec ?: 30) as int, "confirmHome")
+    if (drumIsHome()) scheduleTimer(homeConfirmDelaySec(state.rotationStartedAt), "confirmHome")
 }
 
 def enableSwitchHandler(evt) {
@@ -1519,6 +1543,12 @@ def confirmHome() {
         logDebug "confirmHome fired but the drum does not read home -- waiting"
         return
     }
+    int wait = minRotationRemainingSec(state.rotationStartedAt)
+    if (wait > 0) {
+        logDebug "Drum reads home but has only been rotating ${rotationElapsedSec(state.rotationStartedAt)}s -- re-checking in ${wait}s"
+        scheduleTimer(wait, "confirmHome")
+        return
+    }
     succeed()
 }
 
@@ -1530,6 +1560,11 @@ def confirmFaultRecoveryHome() {
     if (state.phase != "IDLE" || !faultActive()) return
     if (!drumIsHome()) {
         logDebug "confirmFaultRecoveryHome fired but the drum does not read home -- waiting"
+        return
+    }
+    int wait = minRotationRemainingSec(state.faultRecoveryRotationAt)
+    if (wait > 0) {
+        scheduleTimer(wait, "confirmFaultRecoveryHome")
         return
     }
     faultRecoveryComplete()
@@ -1702,6 +1737,9 @@ private fault(String reason) {
     state.faultRecoveryContacts = drumContacts.findAll {
         it.currentValue("contact") == "open"
     }.collect { it.id as String }
+    // Already mid-rotation: when it started is unknown, so count from now
+    // (only ever makes the home confirmation later, never earlier).
+    state.faultRecoveryRotationAt = state.faultRecoveryContacts ? now() : null
     faultDev()?.on()
     sendNotif "Litter Robot: ${reason}"
 
@@ -1973,6 +2011,7 @@ private boolean rotationStarted() {
 // normal sequence's bookkeeping, and vice versa.
 private void noteFaultRecoveryContactOpened(String devId) {
     if (state.faultRecoveryContacts == null) state.faultRecoveryContacts = []
+    if (!state.faultRecoveryContacts) state.faultRecoveryRotationAt = now()
     if (!state.faultRecoveryContacts.contains(devId)) {
         state.faultRecoveryContacts = state.faultRecoveryContacts + [devId]
     }
@@ -1983,6 +2022,29 @@ private boolean faultRecoveryRotationStarted() {
         return (state.faultRecoveryContacts?.size() ?: 0) >= drumContacts.size()
     }
     return (state.faultRecoveryContacts?.size() ?: 0) >= 1
+}
+
+// Minimum rotation time setting. 0 is a valid value (off), so it can't use the
+// usual "?: default" fallback, which would treat 0 as unset.
+private int minRotationSetting() {
+    return settings.minRotationSec != null ? (settings.minRotationSec as int) : 100
+}
+
+private int rotationElapsedSec(Long startedAt) {
+    return startedAt ? (((now() - startedAt) / 1000) as int) : 0
+}
+
+// Seconds until the minimum rotation time has passed (0 once it has, or when
+// the start time is unknown -- then only the debounce applies, as before).
+private int minRotationRemainingSec(Long startedAt) {
+    if (!startedAt) return 0
+    return Math.max(0, minRotationSetting() - rotationElapsedSec(startedAt))
+}
+
+// How long to wait before checking that the drum is really home: the home
+// debounce, stretched so the check can't land before the minimum rotation time.
+private int homeConfirmDelaySec(Long startedAt) {
+    return Math.max((homeDebounceSec ?: 30) as int, minRotationRemainingSec(startedAt))
 }
 
 private boolean drumIsHome() {

@@ -4,6 +4,27 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.7.3
+New "Minimum rotation time (seconds)" setting (`minRotationSec`, Timing page,
+The cycle, default 100, 0 = off). The drum is never confirmed home until it
+has been rotating at least this long, on top of the home debounce.
+
+Why: in 4 of 42 rotations recorded 2026-11-12 to 11-18, Drum Position 2
+closed ~15-18s into the rotation and stayed closed ~70s while the drum paused
+mid-cycle. With `homeDetect = any` (the hub's setting -- needed because
+Drum Position 2 ends 8 of those 42 rotations still reading open), the 30s
+home debounce completed inside that pause and the app went to CLEAN about
+80s before the drum was actually home. Drum Position 1 read closed at the
+end of every rotation. Full rotations take 120-129s and the pause ends by
+~88s, so 100s covers it with margin while staying below a real cycle.
+
+- Rotation start is recorded when rotation is confirmed (first contact open),
+  when an unexpected rotation is adopted, and for fault auto-recovery (first
+  open while faulted, or the fault time if the drum was already moving).
+- `confirmHome()` / `confirmFaultRecoveryHome()` re-check the minimum and
+  reschedule themselves rather than confirm early.
+- Included in "Reset all timing settings to recommended defaults".
+
 ## 2.7.2
 Fixed the watchdog resetting the app to CLEAN while the drum was still
 rotating. `watchdogMinutes` (90) counts from the start of the sequence, so an
