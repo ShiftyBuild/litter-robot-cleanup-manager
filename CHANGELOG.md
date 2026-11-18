@@ -4,6 +4,22 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.9.0
+New **How it runs** section on the main page (between Status and
+Configuration, shown once the required devices are selected). It lays out the
+whole process as numbered steps -- CLEAN, WAIT, PULSE, LR-TIMER, CYCLING, back
+to CLEAN -- using the configured device names, times, calculated timers and
+status light colors, and marks the step the app is in now ("<- now";
+REASSERT marks LR-TIMER).
+
+- Follows the timing mode: in robot-timing mode WAIT is shown as skipped
+  (with its quiet-hours / mode fallback), and pulse extension is described.
+- Reflects re-pulse settings (motion check delay, re-pulse length, maximum
+  re-pulses, or "ignored" when re-pulsing is off), retries / fault, cycle
+  confirmation off, quiet hours, allowed modes, success notification.
+- Footer: mode, a typical one-visit run time, the watchdog, and how a fault
+  shows and clears.
+
 ## 2.8.1
 Fixes from a full logic review (2026-11-18).
 

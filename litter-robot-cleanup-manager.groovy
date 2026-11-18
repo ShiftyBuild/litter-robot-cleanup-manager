@@ -32,6 +32,11 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.9.0  New "How it runs" section on the main page: the whole process step by
+ *         step (CLEAN -> WAIT -> PULSE -> LR-TIMER -> CYCLING -> CLEAN, or the
+ *         robot-timing version), filled in with the configured devices,
+ *         times, calculated timers and light colors, with the current step
+ *         marked. Reflects the settings as saved, so it changes with them.
  *  2.8.1  Fixes from a full logic review:
  *         - Fault auto-recovery (a manual clean cycle clearing a fault) now
  *           really starts the post-cycle cooldown. 2.6.4 meant to do this but
@@ -183,7 +188,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.8.1"
+@Field static final String APP_VERSION = "2.9.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -309,6 +314,12 @@ def mainPage() {
             input "btnReset", "button", title: "Reset to CLEAN now"
             if (enableSwitch && !isEnabled()) {
                 input "btnEnable", "button", title: "Turn auto-clean on"
+            }
+        }
+
+        if (devicesReady()) {
+            section("How it runs") {
+                paragraph processFlowText()
             }
         }
 
@@ -876,6 +887,131 @@ private statusText() {
         lines << "<b>Low battery:</b> ${bits.join(', ')}"
     }
     return lines.join("<br>")
+}
+
+// ---- "How it runs" (main page) -----------------------------------------------
+
+// The whole process as an ordered list, built from the saved settings and
+// devices, so it always describes what the app will actually do. The step the
+// app is in right now is marked.
+private String processFlowText() {
+    boolean robotMode = robotTimingMode == true
+    String phase = state.phase ?: "IDLE"
+    String motionName = motionSensor?.displayName ?: "motion sensor"
+    String catName = catSensorRemote?.displayName ?: "cat sensor"
+    String contactNames = drumContacts ? drumContacts.collect { it.displayName }.join(" and ") : "drum contacts"
+    String rotWord = (rotationDetect ?: "any") == "all" ? "all" : "any"
+    String homeWord = (homeDetect ?: "all") == "any" ? "any" : "all"
+    int pulse = (initialPulseSec ?: 60) as int
+    int maxRe = maxReassertsSetting()
+    int motionHold = countdownMotionDelaySetting()
+    int cool = (cooldownSec ?: 90) as int
+
+    def steps = []
+
+    // CLEAN / trigger
+    def trig = []
+    trig << "Waiting for motion on <b>${motionName}</b>."
+    def ignored = ["while ${enableSwitch?.displayName ?: 'the enable switch'} is off",
+                   "while a fault is active",
+                   "for ${fmtSecs(cool)} after every cycle (cooldown, also after a rotation seen while CLEAN)"]
+    if (allowedModes) ignored << "outside modes ${allowedModes.join(', ')}"
+    trig << "Motion is ignored ${ignored.join('; ')}."
+    steps << [key: "IDLE", title: "CLEAN", lines: trig]
+
+    // WAIT (normal mode, or robot mode's fallback when the pulse is blocked)
+    def waitLines = []
+    int waitMin = (waitMinutes ?: 15) as int
+    int holdMin = (maxHoldMinutes ?: 45) as int
+    if (robotMode) {
+        waitLines << "Skipped -- robot-timing mode pulses straight away."
+        if (allowedModes || quietHoursEnabled) {
+            waitLines << "Used only when quiet hours or a disallowed mode block the pulse: then it " +
+                         "waits ${waitMin} min of no motion as below."
+        }
+    } else {
+        waitLines << "Cat sensor stays off. Pulses after <b>${waitMin} min</b> with no motion; any " +
+                     "motion restarts that ${waitMin} min."
+        waitLines << "Pulses anyway after <b>${holdMin} min</b> in total (maximum wait)."
+    }
+    if (quietHoursEnabled) {
+        waitLines << "Quiet hours: " + ((quietHoursAction == "skip") ? "the sequence is dropped." :
+                     "the pulse is held until they end, at most ${(deferCapMinutes ?: 600) as int} min.")
+    }
+    steps << [key: "WAIT", title: "WAIT", lines: waitLines]
+
+    // PULSE
+    def pulseLines = ["<b>${catName}</b> on for <b>${pulse}s</b>, then off."]
+    if (robotMode) pulseLines << "Motion during the pulse extends it, never past ${PULSE_CAP_SEC}s in total."
+    steps << [key: "PULSE", title: "PULSE", lines: pulseLines]
+
+    // LR-TIMER
+    def timerLines = []
+    timerLines << "The robot's own Clean Cycle Wait Time runs: <b>${robotWaitMinutes()} min</b>."
+    if (robotMode || reassertOnCountdown != false) {
+        timerLines << "Motion here: held ${motionHold}s (dropped if the drum starts), then " +
+                      "${catName} is re-pulsed for ${reassertPulseLen()}s, which restarts the robot's " +
+                      "${robotWaitMinutes()} min. At most <b>${maxRe}</b> re-pulse(s) per sequence; " +
+                      "after that motion is left to the robot."
+    } else {
+        timerLines << "Motion here is ignored (re-pulsing is turned off)."
+    }
+    int attempts = (maxAttempts ?: 3) as int
+    if (retryEnabled == false) {
+        timerLines << "No rotation within <b>${fmtSecs(countdownSec())}</b> of the release: fault."
+    } else {
+        timerLines << "No rotation within <b>${fmtSecs(countdownSec())}</b> of the release: retry " +
+                      "pulse of ${(retryPulseSec ?: 5) as int}s; fault after ${attempts} attempt(s)."
+    }
+    if (confirmCycle == false) {
+        timerLines = ["Cycle confirmation is off: the app returns to CLEAN as soon as the pulse ends."]
+    }
+    steps << [key: "COUNTDOWN", title: "LR-TIMER", lines: timerLines]
+
+    // CYCLING
+    def cycLines = []
+    cycLines << "Starts when <b>${rotWord}</b> of ${contactNames} opens. Motion is ignored."
+    cycLines << "Home when <b>${homeWord}</b> read closed for <b>${(homeDebounceSec ?: 30) as int}s</b> " +
+                "without reopening, and the drum has been rotating at least " +
+                "<b>${minRotationSetting()}s</b>."
+    cycLines << "Not home within <b>${fmtSecs(cycleTimeoutLen())}</b> of the rotation starting: fault."
+    steps << [key: "CYCLING", title: "CYCLING", lines: cycLines]
+
+    // back to CLEAN
+    def doneLines = ["Cycle confirmed${notifySuccess ? ', notification sent' : ''}; " +
+                     "motion ignored for <b>${fmtSecs(cool)}</b> (cooldown)."]
+    steps << [key: "DONE", title: "back to CLEAN", lines: doneLines]
+
+    def items = steps.collect { st ->
+        boolean here = (st.key == phase) || (st.key == "COUNTDOWN" && phase == "REASSERT")
+        String light = ""
+        if (statusLight && st.key != "DONE") {
+            String c = stepColor(st.key)
+            light = " <small>(light: ${c == 'off' ? 'off' : STATUS_COLOR_OPTIONS[c]?.toLowerCase()})</small>"
+        }
+        String head = "<b>${st.title}</b>${light}" + (here ? " <b style='color:#c60'>&larr; now</b>" : "")
+        "<li style='margin-bottom:6px'>${head}<br>${st.lines.join('<br>')}</li>"
+    }
+
+    def footer = []
+    footer << "<b>Mode:</b> " + (robotMode ? "the Litter-Robot handles the timing" :
+                                 "the app waits for a quiet box, then pulses")
+    // One visit, no re-pulses: wait (normal mode) + pulse + robot wait +
+    // a rotation (~2 min, never less than the minimum rotation) + debounce.
+    int typical = (robotMode ? 0 : waitMin * 60) + pulse + robotWaitMinutes() * 60 +
+                  Math.max(minRotationSetting(), 130) + ((homeDebounceSec ?: 30) as int)
+    footer << "<b>Typical run</b> (one visit, no re-pulses): about ${fmtSecs(typical)} from motion to CLEAN"
+    footer << "<b>Watchdog:</b> resets a sequence stuck longer than its calculated budget " +
+              "(${fmtSecs(postReleaseBudgetSec())} after each release); never during a rotation"
+    if (statusLight) {
+        footer << "<b>Fault:</b> light flashes ${STATUS_COLOR_OPTIONS[stepColor('FAULT')]?.toLowerCase()}; " +
+                  "clears on the reset button or a full manual cycle at the robot"
+    } else {
+        footer << "<b>Fault:</b> clears on the reset button or a full manual cycle at the robot"
+    }
+
+    return "<ol style='padding-left:20px;margin:0'>${items.join('')}</ol>" +
+           "<small>${footer.join('<br>')}</small>"
 }
 
 // The single soonest scheduled event for the sequence in progress, from the
