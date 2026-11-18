@@ -32,6 +32,21 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.8.0  Timers that depend on each other are now calculated by the app
+ *         instead of typed in. "Robot's Clean Cycle Wait Time" (3/7/15 min)
+ *         moved to Timing > The cycle and is used in both timing modes:
+ *         - Release -> rotation = robot wait + ROBOT_TIMING_MARGIN_SEC
+ *           (replaces the "Release -> rotation (seconds)" setting, which had
+ *           to be worked out by hand and was left at 540s / 9 min while the
+ *           robot is on 15 min -- every cycle would retry and fault).
+ *         - Watchdog = whatever the current stage can legitimately take,
+ *           re-armed every time control passes back to the robot (replaces
+ *           "Watchdog (minutes)", which had to exceed max wait + pulse +
+ *           robot wait + cycle and ran from the sequence start, so a run of
+ *           reassert pulses used it up).
+ *         - Rotation -> home is never shorter than minimum rotation + home
+ *           debounce + 60s.
+ *         The Timing page shows the calculated values.
  *  2.7.4  Motion during LR-TIMER no longer re-pulses straight away. It is held
  *         for "Motion check delay" (Timing page, The cycle, default 20s); if
  *         the drum starts rotating in that time the motion is treated as the
@@ -146,7 +161,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.7.4"
+@Field static final String APP_VERSION = "2.8.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -228,6 +243,14 @@ import groovy.transform.Field
 // margin before calling a missed cycle -- the drum was observed starting ~4s
 // after a 7-minute wait, so waiting exactly that long would race it.
 @Field static final Integer ROBOT_TIMING_MARGIN_SEC = 120
+
+// Slack added on top of the calculated watchdog budget, so it only ever
+// catches a sequence that is genuinely stuck.
+@Field static final Integer WATCHDOG_MARGIN_SEC = 600
+
+// Rotation -> home is never set shorter than minimum rotation + home debounce
+// plus this, or a normal cycle could time out before it is allowed to confirm.
+@Field static final Integer CYCLE_TIMEOUT_MARGIN_SEC = 60
 
 definition(
     name: "Litter Robot Cleanup Manager",
@@ -501,18 +524,19 @@ def timingPage() {
         }
 
         section("The cycle") {
-            input "rotateTimeoutSec", "number",
-                title: "Release → rotation (seconds)",
-                defaultValue: 540, required: true, range: "30..1800"
-            paragraph "<small>The robot's own internal timer plus margin. Use ~300 for the 3-minute " +
-                      "setting, ~540 for the 7-minute setting (confirmed via log analysis to be this " +
-                      "robot's actual setting), ~1020 for the 15-minute setting.</small>"
+            input "robotTimingMinutes", "enum",
+                title: "Robot's Clean Cycle Wait Time",
+                options: ["3": "3 minutes", "7": "7 minutes", "15": "15 minutes"],
+                defaultValue: "15", required: true, submitOnChange: true
+            paragraph "<small>Set this to match the Clean Cycle Wait Time configured on the robot " +
+                      "itself. Everything that depends on it is calculated from it -- see " +
+                      "<b>Calculated timers</b> below.</small>"
             input "cycleTimeoutSec", "number",
                 title: "Rotation → home (seconds)",
-                defaultValue: 300, required: true, range: "30..1800"
+                defaultValue: 300, required: true, range: "30..1800", submitOnChange: true
             input "homeDebounceSec", "number",
                 title: "Home debounce (seconds)",
-                defaultValue: 30, required: true, range: "1..600"
+                defaultValue: 30, required: true, range: "1..600", submitOnChange: true
             paragraph "<small>How long the drum must stay at home position to count as returned. " +
                       "This is what makes it a real confirmation rather than a single contact blip.</small>"
             input "countdownMotionDelaySec", "number",
@@ -525,7 +549,7 @@ def timingPage() {
                       "seconds later. 0 = pulse immediately, as before.</small>"
             input "minRotationSec", "number",
                 title: "Minimum rotation time (seconds)",
-                defaultValue: 100, required: true, range: "0..600"
+                defaultValue: 100, required: true, range: "0..600", submitOnChange: true
             paragraph "<small>The drum is never confirmed home until it has been rotating at least " +
                       "this long, however the contacts read. A full cycle on this robot takes about " +
                       "2 minutes, and a drum contact can read closed for over a minute while the " +
@@ -547,16 +571,12 @@ def timingPage() {
                 defaultValue: 90, required: true, range: "0..900"
             paragraph "<small>Ignore motion this long after a cycle, so the drum's own movement " +
                       "cannot trigger a new sequence. Set to 0 to disable.</small>"
-            input "watchdogMinutes", "number",
-                title: "Watchdog (minutes)",
-                defaultValue: 90, required: true, range: "5..1440"
-            paragraph "<small>Force a reset if a sequence has not finished in this long, start to " +
-                      "end — wait, pulse, countdown, and cycling together. Must exceed your maximum " +
-                      "wait, or it will cut valid waits short before they ever reach that cap." +
-                      "<br><b>Example:</b> with a 45-minute maximum wait, a 90-minute watchdog leaves " +
-                      "room for the wait cap itself plus the pulse, the robot's own countdown, and " +
-                      "cycle time, while still catching a sequence that's genuinely stuck — a jammed " +
-                      "drum or a sensor that stopped reporting.</small>"
+        }
+
+        section("Calculated timers") {
+            paragraph calculatedTimersText()
+            paragraph "<small>Worked out by the app from the settings above, so they always stay " +
+                      "consistent with each other and with the robot. Nothing to set here.</small>"
         }
     }
 }
@@ -569,7 +589,7 @@ private void resetTimingDefaults() {
         maxHoldMinutes:   [value: "45",  type: "number"],
         initialPulseSec:  [value: "60",  type: "number"],
         reassertPulseSec: [value: "90",  type: "number"],
-        rotateTimeoutSec: [value: "540", type: "number"],
+        robotTimingMinutes: [value: "15", type: "enum"],
         cycleTimeoutSec:  [value: "300", type: "number"],
         homeDebounceSec:  [value: "30",  type: "number"],
         minRotationSec:   [value: "100", type: "number"],
@@ -577,7 +597,6 @@ private void resetTimingDefaults() {
         maxAttempts:      [value: "3",   type: "number"],
         retryPulseSec:    [value: "5",   type: "number"],
         cooldownSec:      [value: "90",  type: "number"],
-        watchdogMinutes:  [value: "90",  type: "number"],
     ].each { key, cfg -> app.updateSetting(key, cfg) }
     logWarn "All timing settings reset to recommended defaults"
     addHistory("Timing settings reset to recommended defaults")
@@ -594,17 +613,13 @@ def optionsPage() {
             input "robotTimingMode", "bool",
                 title: "Let the Litter-Robot handle the timing",
                 defaultValue: false
-            input "robotTimingMinutes", "enum",
-                title: "Robot's Clean Cycle Wait Time",
-                options: ["3": "3 minutes", "7": "7 minutes", "15": "15 minutes"],
-                defaultValue: "15", required: true
             paragraph "<small>On: motion pulses the cat sensor immediately (pulse length is under Timing, " +
                       "default 60s), then the app waits for the drum to rotate -- the robot's own " +
-                      "timer does the waiting. Set this to match the Clean Cycle Wait Time configured on the " +
-                      "robot itself; the app adds ${ROBOT_TIMING_MARGIN_SEC / 60} min of margin before calling a missed cycle. Motion during the pulse extends it (never past " +
+                      "timer does the waiting. Motion during the pulse extends it (never past " +
                       "${PULSE_CAP_SEC}s total); motion during the wait pulses again. The WAIT window " +
-                      "and \"Release \u2192 rotation\" are not used. Quiet hours / disallowed modes still " +
-                      "use the normal wait flow. Off: the app's own wait-then-pulse timing.</small>"
+                      "is not used. Quiet hours / disallowed modes still use the normal wait flow. " +
+                      "Off: the app's own wait-then-pulse timing. Either way the robot's Clean Cycle " +
+                      "Wait Time (Timing page) sets how long the app waits for the drum.</small>"
         }
 
         section("Contact sensor logic") {
@@ -754,13 +769,14 @@ private deviceSummary() {
 }
 
 private timingSummary() {
-    return "${waitMinutes ?: 15} min wait · ${initialPulseSec ?: 60}s/${reassertPulseSec ?: 90}s pulses · " +
+    return "robot wait ${robotWaitMinutes()} min · ${waitMinutes ?: 15} min wait · " +
+           "${initialPulseSec ?: 60}s/${reassertPulseSec ?: 90}s pulses · " +
            "max wait ${maxHoldMinutes ?: 45} min · ${maxAttempts ?: 3} attempts"
 }
 
 private optionsSummary() {
     def bits = []
-    if (robotTimingMode == true) bits << "robot timing (${robotTimingMinutes ?: 15} min)"
+    if (robotTimingMode == true) bits << "robot timing"
     bits << ((confirmCycle == false) ? "no cycle confirmation" : "confirm cycle")
     bits << "rotation: ${rotationDetect ?: 'any'} · home: ${homeDetect ?: 'all'}"
     if (reassertOnCountdown == false) bits << "no countdown re-assert"
@@ -885,10 +901,10 @@ private Integer avgCycleDurationSec() {
 private Integer configuredCycleEstimateSec() {
     if (!initialPulseSec || !cycleTimeoutSec) return null
     // Robot-timing mode has no WAIT window, and its countdown is its own setting.
-    if (robotTimingMode != true && (!waitMinutes || !rotateTimeoutSec)) return null
+    if (robotTimingMode != true && !waitMinutes) return null
     int waitSec = robotTimingMode == true ? 0 : ((waitMinutes as int) * 60)
     return waitSec + (initialPulseSec as int) + countdownSec() +
-           (cycleTimeoutSec as int) + ((homeDebounceSec ?: 0) as int)
+           cycleTimeoutLen() + ((homeDebounceSec ?: 0) as int)
 }
 
 private historyText() {
@@ -1016,10 +1032,6 @@ def initialize() {
     }
 
     // Warn about settings that will misbehave together rather than failing quietly.
-    if (((watchdogMinutes ?: 90) as int) <= ((maxHoldMinutes ?: 45) as int)) {
-        logWarn "Watchdog (${watchdogMinutes} min) is not longer than max wait " +
-                "(${maxHoldMinutes} min) -- valid waits will be cut short"
-    }
     if (((maxHoldMinutes ?: 45) as int) < ((waitMinutes ?: 15) as int) * 2) {
         logWarn "Max wait (${maxHoldMinutes} min) is less than 2x the wait window " +
                 "(${waitMinutes} min) -- forced pulses will be common"
@@ -1406,7 +1418,7 @@ def confirmRotationDetected() {
     // short. cycleTimeout covers CYCLING and faults on a real jam.
     clearTimer("watchdog")
     setPhase("CYCLING")
-    scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
+    scheduleTimer(cycleTimeoutLen(), "cycleTimeout")
 }
 
 // The drum rotated while the app was still in WAIT/PULSE/REASSERT: the robot
@@ -1428,7 +1440,7 @@ def confirmUnexpectedRotation() {
     // short. cycleTimeout covers CYCLING and faults on a real jam.
     clearTimer("watchdog")
     setPhase("CYCLING")
-    scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
+    scheduleTimer(cycleTimeoutLen(), "cycleTimeout")
     // The drum may already be back home, in which case no further "closed"
     // event will arrive to start the home debounce.
     if (drumIsHome()) scheduleTimer(homeConfirmDelaySec(state.rotationStartedAt), "confirmHome")
@@ -1634,7 +1646,7 @@ def watchdog() {
         logInfo "Watchdog fired during CYCLING -- ignored, the rotation timeout covers this phase"
         return
     }
-    logWarn "Watchdog fired -- sequence stuck in ${state.phase} for ${watchdogMinutes} min"
+    logWarn "Watchdog fired -- sequence stuck in ${state.phase} past its calculated time budget"
     addHistory("Watchdog reset from ${phaseLabel(state.phase)}")
     sendNotif "Litter Robot: cleanup sequence stalled in ${phaseLabel(state.phase)} and was reset automatically."
     resetToIdle()
@@ -1660,8 +1672,9 @@ private startSequence() {
     faultDev()?.off()
 
     // Cat sensor stays OFF here -- WAIT never asserts it, only PULSE/REASSERT do.
-    scheduleTimer(((watchdogMinutes ?: 90) as int) * 60, "watchdog")
-    if (robotTimingMode == true && !releaseBlockedReason()) {
+    boolean pulseNow = robotTimingMode == true && !releaseBlockedReason()
+    scheduleTimer(preReleaseBudgetSec(pulseNow) + postReleaseBudgetSec(), "watchdog")
+    if (pulseNow) {
         logInfo "Robot-timing mode -- pulsing the cat sensor right away"
         beginPulse()
     } else {
@@ -1727,8 +1740,58 @@ private void extendPulse() {
     logDebug "Motion during pulse -- pulse now ends in ${secs}s (cap ${PULSE_CAP_SEC}s from start)"
 }
 
+// ---- Calculated timers ------------------------------------------------------
+
+private int robotWaitMinutes() {
+    return (robotTimingMinutes ?: 15) as int
+}
+
+// Release -> rotation: the robot's own Clean Cycle Wait Time plus margin (the
+// drum has been seen starting a few seconds after the wait, so it can't be exact).
 private int countdownSec() {
-    return robotTimingMode == true ? ((((robotTimingMinutes ?: 15) as int) * 60) + ROBOT_TIMING_MARGIN_SEC) : ((rotateTimeoutSec ?: 540) as int)
+    return robotWaitMinutes() * 60 + ROBOT_TIMING_MARGIN_SEC
+}
+
+// Rotation -> home, never shorter than the drum is required to take before it
+// can be confirmed home (minimum rotation + debounce) plus margin.
+private int cycleTimeoutLen() {
+    int floor = minRotationSetting() + ((homeDebounceSec ?: 30) as int) + CYCLE_TIMEOUT_MARGIN_SEC
+    return Math.max((cycleTimeoutSec ?: 300) as int, floor)
+}
+
+// Longest a sequence can legitimately sit before control first passes to the
+// robot: the max wait (or a deferral, if quiet hours defer) plus a full pulse.
+// pulseNow: robot-timing mode pulsing straight away. Robot-timing mode falls
+// back to the normal WAIT flow in quiet hours / disallowed modes, so it is the
+// path actually taken that counts, not the mode setting.
+private int preReleaseBudgetSec(boolean pulseNow) {
+    if (pulseNow) return PULSE_CAP_SEC
+    int waitSec = ((maxHoldMinutes ?: 45) as int) * 60
+    if (quietHoursEnabled && (quietHoursAction ?: "defer") == "defer") {
+        waitSec = Math.max(waitSec, ((deferCapMinutes ?: 600) as int) * 60)
+    }
+    return waitSec + PULSE_CAP_SEC
+}
+
+// Longest a sequence can legitimately take from a release to a confirmed home:
+// the robot's countdown, a full rotation-to-home, plus slack.
+private int postReleaseBudgetSec() {
+    return countdownSec() + cycleTimeoutLen() + WATCHDOG_MARGIN_SEC
+}
+
+private String calculatedTimersText() {
+    def lines = []
+    lines << "<b>Release → rotation:</b> ${fmtSecs(countdownSec())} " +
+             "(robot wait ${robotWaitMinutes()} min + ${ROBOT_TIMING_MARGIN_SEC / 60} min margin) — " +
+             "a retry pulse is sent if the drum hasn't started by then"
+    String cycleNote = cycleTimeoutLen() > ((cycleTimeoutSec ?: 300) as int) ?
+        " (raised from your ${cycleTimeoutSec}s to fit minimum rotation + debounce)" : ""
+    lines << "<b>Rotation → home limit:</b> ${fmtSecs(cycleTimeoutLen())}${cycleNote}"
+    lines << "<b>Watchdog:</b> ${fmtSecs(preReleaseBudgetSec(robotTimingMode == true) + postReleaseBudgetSec())} from the " +
+             "start of a sequence, then ${fmtSecs(postReleaseBudgetSec())} from each time the cat " +
+             "sensor is released (a reassert or retry pulse restarts the robot's own timer, so the " +
+             "watchdog restarts with it)"
+    return lines.join("<br>")
 }
 
 // Called whenever a cat-sensor pulse legitimately ends and control passes back
@@ -1748,6 +1811,9 @@ private release() {
 
     setPhase("COUNTDOWN")
     scheduleTimer(countdownSec(), "rotateTimeout")
+    // The robot's timer just restarted, so the sequence legitimately has a
+    // whole countdown + cycle ahead of it again.
+    scheduleTimer(postReleaseBudgetSec(), "watchdog")
     logInfo "Cat sensor released -- robot's timer running, watching for rotation"
 }
 

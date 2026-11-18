@@ -4,6 +4,33 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.8.0
+Timers that depend on each other are calculated by the app instead of being
+typed in, so they can't drift out of step with the robot or with each other.
+
+- **Robot's Clean Cycle Wait Time** (`robotTimingMinutes`, 3 / 7 / 15 min)
+  moved from Behavior options to Timing > The cycle and now applies in both
+  timing modes, not just robot-timing mode.
+- **Release -> rotation** = robot wait + `ROBOT_TIMING_MARGIN_SEC` (2 min).
+  The `rotateTimeoutSec` input is gone. Found on the hub 2026-11-18: it was
+  540s (9 min) while the robot is on 15 min; with robot-timing mode switched
+  off, every cycle would have sent a retry pulse at 9 min (restarting the
+  robot's timer) and faulted after 3 attempts.
+- **Watchdog** is calculated: max wait (or the quiet-hours deferral cap, if
+  that's longer) + a full pulse + the post-release budget at the start of a
+  sequence, then re-armed to the post-release budget (robot countdown +
+  rotation-to-home limit + `WATCHDOG_MARGIN_SEC` 10 min) every time the cat
+  sensor is released. Reassert and retry pulses restart the robot's own
+  timer, so the watchdog restarts with them instead of running out mid-wait
+  as it did on 2026-11-18. The `watchdogMinutes` input and its "must exceed
+  max wait" warning are gone. Robot-timing mode's fallback to the WAIT flow
+  (quiet hours / disallowed modes) gets the WAIT budget.
+- **Rotation -> home** is never shorter than minimum rotation + home
+  debounce + `CYCLE_TIMEOUT_MARGIN_SEC` (60s).
+- New **Calculated timers** section on the Timing page shows the values in
+  use and why.
+- Values already saved on the hub for the removed settings are ignored.
+
 ## 2.7.4
 Motion during LR-TIMER (COUNTDOWN) is held for "Motion check delay during
 LR-TIMER" (`countdownMotionDelaySec`, Timing page, The cycle, default 20s,
