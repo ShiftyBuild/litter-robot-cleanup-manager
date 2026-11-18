@@ -32,6 +32,17 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.10.0 Cat sensor response check. Every cat-sensor pulse is timed from the
+ *         switch's own reports (how long it was really on), and when the drum
+ *         starts the app checks it started one robot wait after the LAST
+ *         release -- proof the robot registered that pulse (recorded cycles:
+ *         901-910s after the last release on a 15 min wait). If it instead
+ *         lines up with an earlier release, the last pulse was missed; if it
+ *         lines up with none, the robot's wait setting is probably wrong.
+ *         Results show on the Status page with running totals; two misses in
+ *         a row send a notification. The app also warns when the cat sensor
+ *         switch turns on when the app didn't ask it to, or never reported on
+ *         during a pulse.
  *  2.9.1  Status and "How it runs" now sit side by side at the top of the main
  *         page (Status left, How it runs right), stacking on a narrow screen.
  *  2.9.0  New "How it runs" section on the main page: the whole process step by
@@ -190,7 +201,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.9.1"
+@Field static final String APP_VERSION = "2.10.0"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -267,6 +278,14 @@ import groovy.transform.Field
 // Hard ceiling on how long one run of the cat sensor may stay asserted, even
 // when motion keeps extending a pulse in robot-timing mode.
 @Field static final Integer PULSE_CAP_SEC = 90
+
+// Cat sensor response check: the drum should start this close to one robot
+// wait after the release that the robot registered. Recorded cycles land
+// 1-10s after the wait; the window allows for hub/mesh delays either side.
+@Field static final Integer RESPONSE_EARLY_SEC = 60
+@Field static final Integer RESPONSE_LATE_SEC = 120
+// A pulse shorter than this (switch confirmed on too late) is flagged.
+@Field static final Integer MIN_EFFECTIVE_PULSE_SEC = 3
 
 // Robot-timing mode waits the robot's own Clean Cycle Wait Time plus this
 // margin before calling a missed cycle -- the drum was observed starting ~4s
@@ -878,6 +897,8 @@ private statusText() {
         lines << "<b>Last confirmed cycle:</b> ${fmt(state.lastSuccess)}${tookText}"
     }
     if (state.lastFault)   lines << "<b>Last fault:</b> ${state.lastFaultReason} — ${fmt(state.lastFault)}"
+    def resp = pulseResponseText()
+    if (resp) lines << resp
     if (state.lowBatteryDevices) {
         def bits = state.lowBatteryDevices.collect { k, v -> "${v.name} (${v.pct}%)" }
         lines << "<b>Low battery:</b> ${bits.join(', ')}"
@@ -1010,6 +1031,9 @@ private String processFlowText() {
     int typical = (robotMode ? 0 : waitMin * 60) + pulse + robotWaitMinutes() * 60 +
                   Math.max(minRotationSetting(), 130) + ((homeDebounceSec ?: 30) as int)
     footer << "<b>Typical run</b> (one visit, no re-pulses): about ${fmtSecs(typical)} from motion to CLEAN"
+    footer << "<b>Cat sensor check:</b> the drum should start ${robotWaitMinutes()} min after the " +
+              "last pulse; if it follows an earlier pulse instead, the last one was missed " +
+              "(two misses in a row send a notification)"
     footer << "<b>Watchdog:</b> resets a sequence stuck longer than its calculated budget " +
               "(${fmtSecs(postReleaseBudgetSec())} after each release); never during a rotation"
     if (statusLight) {
@@ -1199,6 +1223,7 @@ def initialize() {
     subscribe(motionSensor, "motion", "motionHandler")
     subscribe(drumContacts, "contact", "contactHandler")
     subscribe(enableSwitch, "switch", "enableSwitchHandler")
+    subscribe(catSensorRemote, "switch", "catSensorHandler")
     subscribe(drumContacts, "battery", "batteryHandler")
     if (resetButtonDevice) {
         subscribe(resetButtonDevice, resetButtonAction ?: "pushed", "resetButtonHandler")
@@ -1624,6 +1649,7 @@ def confirmRotationDetected() {
     clearTimer("countdownMotionCheck")
     // This job runs 1s after the first contact opened.
     state.rotationStartedAt = now() - 1000L
+    checkPulseResponse(state.rotationStartedAt)
     clearTimer("rotateTimeout")
     // The drum is moving now: the whole-sequence watchdog must not cut this
     // short. cycleTimeout covers CYCLING and faults on a real jam.
@@ -1801,6 +1827,7 @@ def rotateTimeout() {
         enterWait()
     } else {
         logInfo "Retrying release (attempt ${state.attempts + 1})"
+        state.pulseStarted = now()
         setCatSensor(true)
         scheduleTimer((retryPulseSec ?: 5) as int, "retryPulseDone")
     }
@@ -1874,6 +1901,7 @@ private startSequence() {
     state.sequenceStarted = now()
     state.attempts = 0
     state.reassertCount = 0
+    state.releaseTimes = []
     state.openedContacts = []
     state.deferStarted = null
     state.deferredReason = null
@@ -2017,6 +2045,7 @@ private String calculatedTimersText() {
 // reassert pulse all funnel through here.
 private release() {
     state.openedContacts = []
+    notePulseEnded()
     setCatSensor(false)
 
     if (confirmCycle == false) {
@@ -2328,6 +2357,118 @@ private void scheduleTimer(int seconds, String handler) {
 private void clearTimer(String handler) {
     unschedule(handler)
     state.deadlines?.remove(handler)
+}
+
+// ============================================================================
+//  Cat sensor response check
+// ============================================================================
+
+// The switch's own reports, so pulse timing reflects what the device actually
+// did rather than what was asked of it. Also catches anything else (another
+// app, a dashboard, a button) turning the cat sensor on behind this app's back.
+def catSensorHandler(evt) {
+    if (evt.value == "on") {
+        state.catOnAt = now()
+        if (state.catSensorWant != "on") {
+            logWarn "${catSensorRemote.displayName} turned on but this app did not ask for it " +
+                    "(phase ${state.phase}) -- something else is controlling it"
+            addHistory("Cat sensor turned on outside the app")
+        }
+    } else if (evt.value == "off") {
+        state.catOffAt = now()
+    }
+}
+
+// Called as a pulse ends (initial, reassert or retry): records how long the
+// switch really reported on, and the release time the response check uses.
+private void notePulseEnded() {
+    Long started = state.pulseStarted as Long
+    Long onAt = state.catOnAt as Long
+    if (started && onAt && onAt >= started - 2000L) {
+        int held = ((now() - onAt) / 1000) as int
+        state.lastPulseHeldSec = held
+        if (held < MIN_EFFECTIVE_PULSE_SEC) {
+            logWarn "${catSensorRemote.displayName} was only on for ${held}s of the pulse -- " +
+                    "it reported on late, the robot may not have noticed"
+            addHistory("Cat sensor pulse only ${held}s effective")
+        }
+    } else if (started) {
+        state.lastPulseHeldSec = null
+        logWarn "${catSensorRemote.displayName} never reported on during this pulse -- " +
+                "the robot was probably not triggered"
+        addHistory("Cat sensor never reported on during a pulse")
+    }
+    state.releaseTimes = ((state.releaseTimes ?: []) + [now()]).takeRight(60)
+}
+
+// When the drum starts, work out which release the robot was counting from.
+// It restarts its own wait every time the cat sensor clears, so it should
+// start one robot wait after the LAST release.
+private void checkPulseResponse(Long rotationAt) {
+    List rel = (state.releaseTimes ?: []) as List
+    if (!rel || !rotationAt) return
+    int expected = robotWaitMinutes() * 60
+    def fits = { Long r ->
+        int d = ((rotationAt - r) / 1000) as int
+        d >= expected - RESPONSE_EARLY_SEC && d <= expected + RESPONSE_LATE_SEC
+    }
+    Long last = rel[-1] as Long
+    int sinceLast = ((rotationAt - last) / 1000) as int
+    String result
+    String text
+    if (fits(last)) {
+        result = "ok"
+        text = "robot registered the last pulse -- drum started ${fmtSecs(sinceLast)} after it" +
+               (state.lastPulseHeldSec != null ? " (switch on ${state.lastPulseHeldSec}s)" : "")
+    } else {
+        Long matched = rel.reverse().find { fits(it as Long) } as Long
+        if (matched) {
+            result = "missed"
+            text = "robot did NOT register the pulse released at ${fmt(last)} -- the drum started " +
+                   "${fmtSecs(((rotationAt - matched) / 1000) as int)} after an earlier one (${fmt(matched)})"
+        } else if (sinceLast < expected - RESPONSE_EARLY_SEC) {
+            result = "other"
+            text = "drum started ${fmtSecs(sinceLast)} after the last pulse, sooner than the robot's " +
+                   "${robotWaitMinutes()} min wait -- check the Clean Cycle Wait Time setting matches the robot"
+        } else {
+            result = "other"
+            text = "drum started ${fmtSecs(sinceLast)} after the last pulse, later than the robot's " +
+                   "${robotWaitMinutes()} min wait -- a cat in the box holds the robot off; if this keeps " +
+                   "happening, check the Clean Cycle Wait Time setting"
+        }
+    }
+
+    def stats = (state.pulseStats ?: [ok: 0, missed: 0, other: 0]) as Map
+    stats[result] = ((stats[result] ?: 0) as int) + 1
+    state.pulseStats = stats
+    state.pulseCheckResult = result
+    state.pulseCheckText = text
+    state.pulseCheckAt = now()
+
+    if (result == "ok") {
+        logInfo "Cat sensor check: ${text}"
+        state.pulseMissStreak = 0
+    } else {
+        logWarn "Cat sensor check: ${text}"
+        addHistory("Cat sensor check: ${result}")
+        if (result == "missed") {
+            state.pulseMissStreak = ((state.pulseMissStreak ?: 0) as int) + 1
+            if (state.pulseMissStreak == 2) {
+                sendNotif "Litter Robot: the robot ignored the cat sensor pulse twice in a row -- " +
+                          "check ${catSensorRemote.displayName} and its wiring to the robot."
+            }
+        }
+    }
+}
+
+private String pulseResponseText() {
+    if (!state.pulseCheckAt) return null
+    def st = (state.pulseStats ?: [:]) as Map
+    String mark = state.pulseCheckResult == "ok" ? "&#10003;" :
+                  state.pulseCheckResult == "missed" ? "<b style='color:#c00'>&#10007;</b>" : "<b>?</b>"
+    return "<b>Cat sensor check:</b> ${mark} ${state.pulseCheckText} (${fmt(state.pulseCheckAt as Long)})" +
+           "<br>&nbsp;&nbsp;<small>${st.ok ?: 0} registered · ${st.missed ?: 0} missed · " +
+           "${st.other ?: 0} unclear</small>"
 }
 
 // ============================================================================

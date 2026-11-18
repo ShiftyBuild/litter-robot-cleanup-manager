@@ -4,6 +4,33 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.10.0
+Cat sensor response check -- confirms the robot actually registered the
+app's pulses, not just that the cat-sensor switch reported on/off.
+
+- **How:** the robot restarts its Clean Cycle Wait Time each time the cat
+  sensor clears, so the drum should start one robot wait after the *last*
+  release. Every release time in a sequence is recorded (`releaseTimes`).
+  When rotation is confirmed, `checkPulseResponse()` classifies it:
+  - **registered** -- within -60s / +120s of robot wait after the last release;
+  - **missed** -- doesn't fit the last release but fits an earlier one, so the
+    robot ignored the later pulse(s);
+  - **unclear** -- fits none: sooner than the wait (wait setting doesn't match
+    the robot) or later (a cat in the box held the robot off, or setting).
+  Recorded data 2026-11-13..18: all 39 app-driven rotations started 901-910s
+  after the last release on a 15 min wait.
+- **Pulse timing from the device:** subscribes to the cat sensor switch and
+  times each pulse from its own "on" report to the release
+  (`lastPulseHeldSec`). Warns if the switch never reported on during a pulse,
+  or was on for under `MIN_EFFECTIVE_PULSE_SEC` (3s).
+- **Outside control:** warns (log + history) when the cat sensor switch turns
+  on without the app asking -- e.g. 2026-11-18 08:13:30, during a fault.
+- **Shown** on the Status page (last result with a check/cross, time, and
+  running registered / missed / unclear totals) and in the How it runs
+  footer. Two misses in a row send a notification.
+- Retry pulses now set `pulseStarted` so they're timed too.
+- The new subscription only starts after **Done** is pressed on the main page.
+
 ## 2.9.1
 Status and **How it runs** are side by side at the top of the main page:
 Status on the left, How it runs on the right, both inside the Status
