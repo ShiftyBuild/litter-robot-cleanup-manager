@@ -4,6 +4,18 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.7.1
+The Status section shows the live state of the sensors the app depends on:
+
+- **Motion:** the motion sensor's current value (active in bold) and how long
+  it has been in that state, with the time it changed.
+- **Drum contacts:** a summary (all closed / all open / N of M closed) and
+  each contact's value, duration and change time (open in bold).
+
+Values are read from the devices each time the page is opened; nothing is
+stored. A device that has never reported, or can't be read, says so instead
+of breaking the page.
+
 ## 2.7.0
 Status light colors are now configurable per step. New "Status light colors"
 page (main page, Configuration) with one color choice each for CLEAN, WAIT,

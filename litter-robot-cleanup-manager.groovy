@@ -32,6 +32,11 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.7.1  The Status section now shows the live state of the motion sensor and
+ *         every drum contact sensor, each with how long it has been in that
+ *         state (e.g. "inactive for 12m (since Nov 18, 9:02:11 AM)"), plus
+ *         whether all drum contacts currently read home. Read straight from
+ *         the devices each time the page is opened.
  *  2.7.0  Status light colors are now configurable per step. New "Status light
  *         colors" page (main page, Configuration) with one color choice each
  *         for CLEAN, WAIT, PULSE, REASSERT, LR-TIMER, CYCLING and the flashing
@@ -116,7 +121,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.7.0"
+@Field static final String APP_VERSION = "2.7.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -742,6 +747,8 @@ private statusText() {
     if (enableSwitch && !isEnabled()) {
         lines << "<b>Enabled:</b> No — ${enableSwitch.displayName} is off, motion is being ignored"
     }
+    def sensors = sensorStatusText()
+    if (sensors) lines << sensors
 
     def estBits = []
     def avg = avgCycleDurationSec()
@@ -848,6 +855,41 @@ private historyText() {
         "<small>${fmt(h.t)}</small></td><td><small>${h.e}</small></td></tr>"
     }.join("")
     return "<table>${rows}</table>"
+}
+
+// Live state of the motion sensor and each drum contact, read from the devices
+// when the page renders, with how long each has been in that state. Lets the
+// Status page be checked against what is physically happening at the robot.
+private String sensorStatusText() {
+    def lines = []
+    if (motionSensor) {
+        lines << "<b>Motion:</b> ${deviceStateText(motionSensor, 'motion', 'active')}"
+    }
+    if (drumContacts) {
+        def bits = drumContacts.collect { dev ->
+            "${dev.displayName} ${deviceStateText(dev, 'contact', 'open')}"
+        }
+        def closed = drumContacts.count { it.currentValue("contact") == "closed" }
+        String home = closed == drumContacts.size() ? "all closed (home)" :
+                      closed == 0 ? "all open" : "${closed} of ${drumContacts.size()} closed"
+        lines << "<b>Drum contacts:</b> ${home}<br>&nbsp;&nbsp;" + bits.join("<br>&nbsp;&nbsp;")
+    }
+    return lines.join("<br>")
+}
+
+// "<value> for <duration> (since <time>)" for one attribute of one device, with
+// the value in bold when it matches highlightValue (active motion / open contact).
+private String deviceStateText(dev, String attr, String highlightValue) {
+    try {
+        def st = dev.currentState(attr)
+        if (st == null) return "<i>no ${attr} reported yet</i>"
+        String v = st.value
+        String shown = v == highlightValue ? "<b>${v}</b>" : v
+        Long since = st.date?.time
+        return since ? "${shown} for ${elapsed(since)} (since ${fmt(since)})" : shown
+    } catch (e) {
+        return "<i>could not read ${attr}: ${e.message}</i>"
+    }
 }
 
 private fmt(Long epoch) {
