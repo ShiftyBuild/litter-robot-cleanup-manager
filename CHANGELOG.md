@@ -4,6 +4,21 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.7.2
+Fixed the watchdog resetting the app to CLEAN while the drum was still
+rotating. `watchdogMinutes` (90) counts from the start of the sequence, so an
+LR-TIMER stretched out by many reassert pulses (each one restarts the robot's
+own 15-minute timer) used up the whole budget and the watchdog fired 42s into
+the real rotation (2026-11-18: sequence 10:10:31, rotation 11:39:49, watchdog
+11:40:31, drum home 11:41:57). The app skipped the home confirmation and the
+post-cycle cooldown.
+
+- The watchdog is cancelled when rotation is confirmed (both the normal path
+  and an adopted unexpected rotation).
+- `watchdog()` ignores CYCLING outright, in case a job was already queued.
+- CYCLING stays protected by `cycleTimeoutSec` ("Rotation -> home"), which
+  faults on a real jam.
+
 ## 2.7.1
 The Status section shows the live state of the sensors the app depends on:
 

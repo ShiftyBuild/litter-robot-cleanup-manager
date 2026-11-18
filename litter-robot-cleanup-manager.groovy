@@ -32,6 +32,14 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.7.2  Fixed the watchdog resetting to CLEAN while the drum was still
+ *         rotating. The watchdog counts from the start of the sequence, so a
+ *         long LR-TIMER (many reassert pulses, each restarting the robot's own
+ *         timer) could use up the whole 90 minutes and have it fire seconds
+ *         into the real rotation -- seen 2026-11-18: rotation 11:39:49,
+ *         watchdog 11:40:31, drum home 11:41:57. The watchdog is now cancelled
+ *         once rotation is confirmed; CYCLING is covered by the "Rotation ->
+ *         home" timeout, which faults on a real jam.
  *  2.7.1  The Status section now shows the live state of the motion sensor and
  *         every drum contact sensor, each with how long it has been in that
  *         state (e.g. "inactive for 12m (since Nov 18, 9:02:11 AM)"), plus
@@ -121,7 +129,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.7.1"
+@Field static final String APP_VERSION = "2.7.2"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -1320,6 +1328,9 @@ def confirmRotationDetected() {
     }
     logInfo "Drum rotation detected -- confirming completion"
     clearTimer("rotateTimeout")
+    // The drum is moving now: the whole-sequence watchdog must not cut this
+    // short. cycleTimeout covers CYCLING and faults on a real jam.
+    clearTimer("watchdog")
     setPhase("CYCLING")
     scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
 }
@@ -1338,6 +1349,9 @@ def confirmUnexpectedRotation() {
     state.deferStarted = null
     state.deferredReason = null
     setCatSensor(false)
+    // The drum is moving now: the whole-sequence watchdog must not cut this
+    // short. cycleTimeout covers CYCLING and faults on a real jam.
+    clearTimer("watchdog")
     setPhase("CYCLING")
     scheduleTimer((cycleTimeoutSec ?: 300) as int, "cycleTimeout")
     // The drum may already be back home, in which case no further "closed"
@@ -1528,6 +1542,12 @@ def cycleTimeout() {
 
 def watchdog() {
     if (state.phase == "IDLE") return
+    // Belt and braces for a watchdog job queued before rotation was confirmed:
+    // never abandon a rotation in progress.
+    if (state.phase == "CYCLING") {
+        logInfo "Watchdog fired during CYCLING -- ignored, the rotation timeout covers this phase"
+        return
+    }
     logWarn "Watchdog fired -- sequence stuck in ${state.phase} for ${watchdogMinutes} min"
     addHistory("Watchdog reset from ${phaseLabel(state.phase)}")
     sendNotif "Litter Robot: cleanup sequence stalled in ${phaseLabel(state.phase)} and was reset automatically."
