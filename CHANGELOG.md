@@ -4,6 +4,47 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.8.1
+Fixes from a full logic review (2026-11-18).
+
+- **Fault auto-recovery now starts the cooldown.** `faultRecoveryComplete()`
+  sets `cooldownUntil`. The 2.6.4 entry said it did, but that commit added it
+  to `performManualReset()` (the reset button) instead, so motion after a
+  manual cycle still started a new sequence (seen 2026-11-12 08:54 -> 09:03
+  and 2026-11-18 08:16 -> 08:21). The button keeps its cooldown too.
+- **Watchdog re-armed on returning to WAIT.** `rotateTimeout()` -> `enterWait()`
+  (missed rotation with motion active, normal mode) now re-arms the watchdog
+  with the full wait budget. Since 2.8.0 it was left at the ~32 min
+  post-release budget and could reset a legitimate 45 min wait. Regression
+  from 2.8.0.
+- **Rotation while CLEAN holds the cooldown.** Any drum contact opening while
+  the app is idle (no fault) sets `cooldownUntil` to `cooldownSec` from that
+  moment, so the cooldown runs until `cooldownSec` after the drum stops. The
+  drum trips the motion sensor ~38s into a rotation (9 of 42 recorded), which
+  would otherwise start a sequence and a second cycle after a manual Clean at
+  the robot or a cycle the robot starts itself.
+- **New "Maximum re-pulses per sequence"** (`maxReasserts`, Behavior options,
+  default 3, 1-50). Counted per sequence (`state.reassertCount`); after the
+  limit, motion during LR-TIMER is logged and left to the robot's own cat
+  detection. Applies in both timing modes. Without it, motion within every
+  15 min kept restarting the robot's timer (2026-11-18: no clean 08:21-11:39),
+  and since 2.8.0 the watchdog no longer stopped it.
+- **Fault recovery no longer bypasses the minimum rotation time.** `fault()`
+  only seeds already-open contacts (and the rotation start time) when the
+  fault happened in CYCLING; the start is the real `rotationStartedAt`.
+  Before, a contact simply left open from an earlier cycle (Drum Position 2
+  often ends open) counted as a rotation under way since the fault, so a
+  later manual cycle got only the debounce.
+- **Watchdog covers mode-restriction deferrals.** The pre-release budget uses
+  `deferCapMinutes` whenever a pulse can be deferred (allowed modes or quiet
+  hours, unless quiet hours are set to skip), not only for quiet-hours defer.
+- **Stale motion check.** A `countdownMotionCheck` deadline only counts as
+  pending while it is in the future, so one left behind by a hub restart
+  can't block re-pulses. The pending check is listed under "Next expected
+  action" during LR-TIMER.
+- **Contact logic help text** now explains the chatter / debounce and that
+  home must be "any" when a contact can end a cycle open.
+
 ## 2.8.0
 Timers that depend on each other are calculated by the app instead of being
 typed in, so they can't drift out of step with the robot or with each other.

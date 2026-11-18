@@ -32,6 +32,28 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.8.1  Fixes from a full logic review:
+ *         - Fault auto-recovery (a manual clean cycle clearing a fault) now
+ *           really starts the post-cycle cooldown. 2.6.4 meant to do this but
+ *           put it on the manual reset button instead.
+ *         - Going back to WAIT after a missed rotation re-arms the watchdog,
+ *           so it can't reset a legitimate wait (regression from 2.8.0).
+ *         - A drum rotation seen while CLEAN (Clean pressed on the robot, or
+ *           the robot cycling on its own) now holds the cooldown until
+ *           cooldownSec after the drum stops, so the drum tripping the
+ *           motion sensor can't start a new sequence.
+ *         - New "Maximum re-pulses per sequence" (Behavior options, default
+ *           3). After that, motion during LR-TIMER is left to the robot's
+ *           own cat detection, so steady motion can't keep restarting the
+ *           robot's timer forever (2026-11-18: no clean from 08:21 to 11:39).
+ *         - Fault recovery only treats the drum as already rotating when the
+ *           fault happened mid-rotation; a contact left open from an earlier
+ *           cycle no longer bypasses the minimum rotation time.
+ *         - The watchdog allows for a deferral caused by mode restrictions,
+ *           not just quiet hours.
+ *         - A motion check left over from a hub restart no longer blocks
+ *           re-pulses; the pending check shows under "Next expected action".
+ *         - Contact logic help text matches this robot (any / any).
  *  2.8.0  Timers that depend on each other are now calculated by the app
  *         instead of typed in. "Robot's Clean Cycle Wait Time" (3/7/15 min)
  *         moved to Timing > The cycle and is used in both timing modes:
@@ -161,7 +183,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.8.0"
+@Field static final String APP_VERSION = "2.8.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -633,9 +655,12 @@ def optionsPage() {
                 options: ["all": "ALL drum contacts are closed",
                           "any": "ANY drum contact is closed"],
                 defaultValue: "all", required: true
-            paragraph "<small>If your two sensors sit at different points in the rotation, " +
-                      "<b>all</b>/<b>all</b> gives the strictest confirmation. If they are redundant " +
-                      "sensors on the same position, use <b>any</b>/<b>all</b>.</small>"
+            paragraph "<small>The drum contacts open and close many times during a cycle; the home " +
+                      "debounce and minimum rotation time (Timing page) filter that out. Use " +
+                      "<b>any</b> for home if a contact can finish a cycle still reading open -- " +
+                      "on this robot Drum Position 2 sometimes does, and <b>all</b> would then " +
+                      "fault the cycle. <b>all</b> for home only suits contacts that always " +
+                      "close at rest.</small>"
         }
 
         section("What to confirm") {
@@ -654,9 +679,18 @@ def optionsPage() {
             input "reassertOnCountdown", "bool",
                 title: "Fire a reassert pulse if motion returns during the countdown",
                 defaultValue: true
-            paragraph "<small>A cat returning during the countdown fires an immediate reassert pulse " +
-                      "(see the pulse length under Timing), then resumes the countdown once it ends -- " +
-                      "no full new wait. Off: the countdown runs to completion regardless.</small>"
+            paragraph "<small>A cat returning during the countdown fires a reassert pulse " +
+                      "(see the pulse length and motion check delay under Timing), then resumes the " +
+                      "countdown once it ends -- no full new wait. Off: the countdown runs to " +
+                      "completion regardless. Robot-timing mode always re-pulses, up to the limit " +
+                      "below.</small>"
+            input "maxReasserts", "number",
+                title: "Maximum re-pulses per sequence",
+                defaultValue: 3, required: true, range: "1..50"
+            paragraph "<small>Each re-pulse restarts the robot's own Clean Cycle Wait Time, so motion " +
+                      "that keeps coming back can stop the robot ever cleaning. After this many in one " +
+                      "sequence, further motion is left to the robot's own cat detection (which still " +
+                      "holds off the cycle while a cat is actually in the box).</small>"
         }
 
     }
@@ -865,6 +899,7 @@ private String upcomingEventsText() {
             break
         case "COUNTDOWN":
             add("retry/fault if no rotation", state.deadlines?.rotateTimeout)
+            add("re-pulse for motion unless the drum starts", state.deadlines?.countdownMotionCheck)
             add("retry pulse ends", state.deadlines?.retryPulseDone)
             break
         case "REASSERT":
@@ -1183,6 +1218,10 @@ private void faultRecoveryComplete() {
     state.faultRecoveryContacts = []
     state.faultRecoveryRotationAt = null
     state.statusLightBoosted = true
+    // The drum has just finished a cycle: same cooldown as a normal completed
+    // cycle, so its own movement (or the person who ran it walking away)
+    // can't start a new sequence straight away.
+    state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
     resetToIdle()
 }
 
@@ -1258,10 +1297,16 @@ def motionHandler(evt) {
                     logDebug "Motion during countdown -- reassert disabled by config, ignoring"
                     return
                 }
+                int maxRe = maxReassertsSetting()
+                if ((state.reassertCount ?: 0) >= maxRe) {
+                    logInfo "Motion during robot countdown -- already re-pulsed ${maxRe} time(s) this " +
+                            "sequence, leaving it to the robot's own cat detection"
+                    return
+                }
                 int hold = countdownMotionDelaySetting()
                 if (hold <= 0) {
                     countdownMotionConfirmed()
-                } else if (state.deadlines?.countdownMotionCheck) {
+                } else if ((state.deadlines?.countdownMotionCheck ?: 0L) > now()) {
                     logDebug "Motion during countdown -- check already pending"
                 } else {
                     logInfo "Motion during robot countdown -- re-pulsing in ${hold}s unless the drum starts rotating"
@@ -1322,6 +1367,21 @@ def contactHandler(evt) {
             // motion right after start a normal WAIT cycle instead of settling
             // at CLEAN. Debounce it exactly like confirmHome() does.
             scheduleTimer(homeConfirmDelaySec(state.faultRecoveryRotationAt), "confirmFaultRecoveryHome")
+        }
+        return
+    }
+
+    // Drum turning while CLEAN: Clean pressed on the robot, or the robot
+    // cycling on its own. Not a sequence of ours, but the drum trips the motion
+    // sensor (~38s into a rotation), so hold the cooldown until cooldownSec
+    // after the last contact movement.
+    if (state.phase == "IDLE") {
+        if (evt.value == "open") {
+            if (!inCooldown()) {
+                logInfo "Drum rotating while CLEAN -- ignoring motion until ${cooldownSec ?: 90}s after it stops"
+                addHistory("Drum rotated while CLEAN; cooldown held")
+            }
+            state.cooldownUntil = now() + (((cooldownSec ?: 90) as int) * 1000)
         }
         return
     }
@@ -1387,9 +1447,15 @@ def countdownMotionCheck() {
 }
 
 private void countdownMotionConfirmed() {
-    logInfo "Cat returned during robot countdown -- firing reassert pulse"
+    state.reassertCount = (state.reassertCount ?: 0) + 1
+    logInfo "Cat returned during robot countdown -- firing reassert pulse " +
+            "(${state.reassertCount} of ${maxReassertsSetting()})"
     addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseLen()}s")
     enterReassert()
+}
+
+private int maxReassertsSetting() {
+    return (maxReasserts ?: 3) as int
 }
 
 // 0 is a valid value (off), so no "?: default" fallback.
@@ -1662,6 +1728,7 @@ private startSequence() {
 
     state.sequenceStarted = now()
     state.attempts = 0
+    state.reassertCount = 0
     state.openedContacts = []
     state.deferStarted = null
     state.deferredReason = null
@@ -1692,6 +1759,9 @@ private enterWait() {
 
     // Hard cap on the wait phase, re-armed each time we enter it.
     scheduleTimer(((maxHoldMinutes ?: 45) as int) * 60, "holdCapReached")
+    // Coming back here from a missed rotation means a whole new wait is
+    // ahead, so the watchdog gets the full wait budget again.
+    scheduleTimer(preReleaseBudgetSec(false) + postReleaseBudgetSec(), "watchdog")
 
     if (motionSensor.currentValue("motion") == "inactive") {
         scheduleTimer(((waitMinutes ?: 15) as int) * 60, "waitElapsed")
@@ -1767,7 +1837,10 @@ private int cycleTimeoutLen() {
 private int preReleaseBudgetSec(boolean pulseNow) {
     if (pulseNow) return PULSE_CAP_SEC
     int waitSec = ((maxHoldMinutes ?: 45) as int) * 60
-    if (quietHoursEnabled && (quietHoursAction ?: "defer") == "defer") {
+    // waitElapsed() defers a blocked pulse (disallowed mode or quiet hours) for
+    // up to deferCapMinutes, unless quiet hours are set to skip.
+    boolean skip = quietHoursEnabled && quietHoursAction == "skip"
+    if ((allowedModes || quietHoursEnabled) && !skip) {
         waitSec = Math.max(waitSec, ((deferCapMinutes ?: 600) as int) * 60)
     }
     return waitSec + PULSE_CAP_SEC
@@ -1851,12 +1924,20 @@ private fault(String reason) {
     // fire for those contacts. Without this, a fault that started this way could
     // never be detected as recovered, since faultRecoveryRotationStarted() would
     // wait forever for an "open" event that already happened before the fault.
-    state.faultRecoveryContacts = drumContacts.findAll {
-        it.currentValue("contact") == "open"
-    }.collect { it.id as String }
-    // Already mid-rotation: when it started is unknown, so count from now
-    // (only ever makes the home confirmation later, never earlier).
-    state.faultRecoveryRotationAt = state.faultRecoveryContacts ? now() : null
+    // Only when the fault happened mid-rotation: a contact that is merely left
+    // open from an earlier cycle (Drum Position 2 often ends a cycle reading
+    // open) would otherwise count as a rotation already under way, and the
+    // next stray "closed" could clear the fault without any manual cycle.
+    if (state.phase == "CYCLING") {
+        state.faultRecoveryContacts = drumContacts.findAll {
+            it.currentValue("contact") == "open"
+        }.collect { it.id as String }
+        state.faultRecoveryRotationAt = state.faultRecoveryContacts ?
+            (state.rotationStartedAt ?: now()) : null
+    } else {
+        state.faultRecoveryContacts = []
+        state.faultRecoveryRotationAt = null
+    }
     faultDev()?.on()
     sendNotif "Litter Robot: ${reason}"
 
