@@ -32,6 +32,14 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.7.4  Motion during LR-TIMER no longer re-pulses straight away. It is held
+ *         for "Motion check delay" (Timing page, The cycle, default 20s); if
+ *         the drum starts rotating in that time the motion is treated as the
+ *         drum and dropped, otherwise the reassert pulse fires as before.
+ *         Closes the window where the drum is already moving but its contacts
+ *         haven't reported open yet. The drum is known to trip the motion
+ *         sensor itself (9 of 42 recorded rotations, always 37-40s in, while
+ *         already in CYCLING).
  *  2.7.3  New "Minimum rotation time" timer (Timing page, The cycle, default
  *         100s). The drum can't be confirmed home until it has been rotating
  *         at least this long, on top of the home debounce. Drum Position 2
@@ -138,7 +146,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.7.3"
+@Field static final String APP_VERSION = "2.7.4"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -507,6 +515,14 @@ def timingPage() {
                 defaultValue: 30, required: true, range: "1..600"
             paragraph "<small>How long the drum must stay at home position to count as returned. " +
                       "This is what makes it a real confirmation rather than a single contact blip.</small>"
+            input "countdownMotionDelaySec", "number",
+                title: "Motion check delay during LR-TIMER (seconds)",
+                defaultValue: 20, required: true, range: "0..120"
+            paragraph "<small>Motion while the robot's timer is running is held this long before " +
+                      "the reassert pulse fires. If the drum starts rotating in the meantime, the " +
+                      "motion is taken to be the drum itself (it can move before its contacts " +
+                      "report open) and is ignored. A real cat still gets its pulse, just this many " +
+                      "seconds later. 0 = pulse immediately, as before.</small>"
             input "minRotationSec", "number",
                 title: "Minimum rotation time (seconds)",
                 defaultValue: 100, required: true, range: "0..600"
@@ -557,6 +573,7 @@ private void resetTimingDefaults() {
         cycleTimeoutSec:  [value: "300", type: "number"],
         homeDebounceSec:  [value: "30",  type: "number"],
         minRotationSec:   [value: "100", type: "number"],
+        countdownMotionDelaySec: [value: "20", type: "number"],
         maxAttempts:      [value: "3",   type: "number"],
         retryPulseSec:    [value: "5",   type: "number"],
         cooldownSec:      [value: "90",  type: "number"],
@@ -1229,9 +1246,15 @@ def motionHandler(evt) {
                     logDebug "Motion during countdown -- reassert disabled by config, ignoring"
                     return
                 }
-                logInfo "Cat returned during robot countdown -- firing reassert pulse"
-                addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseLen()}s")
-                enterReassert()
+                int hold = countdownMotionDelaySetting()
+                if (hold <= 0) {
+                    countdownMotionConfirmed()
+                } else if (state.deadlines?.countdownMotionCheck) {
+                    logDebug "Motion during countdown -- check already pending"
+                } else {
+                    logInfo "Motion during robot countdown -- re-pulsing in ${hold}s unless the drum starts rotating"
+                    scheduleTimer(hold, "countdownMotionCheck")
+                }
                 break
 
             case "REASSERT":
@@ -1339,6 +1362,29 @@ def contactHandler(evt) {
     }
 }
 
+// Fires countdownMotionDelaySec after motion during COUNTDOWN. Still in
+// COUNTDOWN means the drum didn't start moving, so it was a cat: re-pulse.
+// Any other phase (rotation confirmed, reset, fault) means there's nothing to do.
+def countdownMotionCheck() {
+    clearTimer("countdownMotionCheck")
+    if (state.phase != "COUNTDOWN") {
+        logDebug "Countdown motion check fired in ${state.phase} -- nothing to do"
+        return
+    }
+    countdownMotionConfirmed()
+}
+
+private void countdownMotionConfirmed() {
+    logInfo "Cat returned during robot countdown -- firing reassert pulse"
+    addHistory("Motion during countdown; pulsed cat sensor ${reassertPulseLen()}s")
+    enterReassert()
+}
+
+// 0 is a valid value (off), so no "?: default" fallback.
+private int countdownMotionDelaySetting() {
+    return settings.countdownMotionDelaySec != null ? (settings.countdownMotionDelaySec as int) : 20
+}
+
 // Runs once per rotation no matter how many near-simultaneous drum-contact
 // events raced to schedule it -- runIn(..., [overwrite: true]) guarantees only
 // one queued invocation of this job name exists at a time.
@@ -1348,6 +1394,11 @@ def confirmRotationDetected() {
         return
     }
     logInfo "Drum rotation detected -- confirming completion"
+    if (state.deadlines?.countdownMotionCheck) {
+        logInfo "Motion just before rotation was the drum, not a cat -- no reassert pulse"
+        addHistory("Motion just before rotation ignored (drum)")
+    }
+    clearTimer("countdownMotionCheck")
     // This job runs 1s after the first contact opened.
     state.rotationStartedAt = now() - 1000L
     clearTimer("rotateTimeout")
@@ -1966,7 +2017,7 @@ private void stopFaultBlink() {
 private unscheduleAll() {
     ["waitElapsed", "holdCapReached", "pulseDone", "rotateTimeout", "retryPulseDone",
      "reassertPulseDone", "confirmRotationDetected", "confirmUnexpectedRotation", "confirmHome", "confirmFaultRecoveryHome",
-     "cycleTimeout", "watchdog", "statusLightOff"].each { clearTimer(it) }
+     "cycleTimeout", "watchdog", "statusLightOff", "countdownMotionCheck"].each { clearTimer(it) }
     stopFaultBlink()
 }
 

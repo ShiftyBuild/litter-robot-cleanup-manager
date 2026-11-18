@@ -4,6 +4,21 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.7.4
+Motion during LR-TIMER (COUNTDOWN) is held for "Motion check delay during
+LR-TIMER" (`countdownMotionDelaySec`, Timing page, The cycle, default 20s,
+0 = old immediate behaviour) before the reassert pulse fires.
+
+- If the drum starts rotating within the delay, the motion is treated as the
+  drum (it can move before its contacts report open) and dropped -- logged
+  as "Motion just before rotation was the drum, not a cat".
+- Otherwise the pulse fires as before, just that many seconds later. Further
+  motion while a check is pending doesn't stack another one.
+- Evidence the drum trips the sensor: in 9 of 42 rotations recorded
+  2026-11-13..18 the sensor went active 37-40s after the first contact
+  opened (already CYCLING, so ignored). No motion was seen in the seconds
+  before a rotation started; this closes that window anyway.
+
 ## 2.7.3
 New "Minimum rotation time (seconds)" setting (`minRotationSec`, Timing page,
 The cycle, default 100, 0 = off). The drum is never confirmed home until it
