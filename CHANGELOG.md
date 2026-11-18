@@ -4,6 +4,14 @@ Full version history for `litter-robot-cleanup-manager.groovy`. The file itself
 only keeps its header's CHANGELOG section for the current version — this is
 the complete record.
 
+## 2.9.1
+Status and **How it runs** are side by side at the top of the main page:
+Status on the left, How it runs on the right, both inside the Status
+section. Done as one HTML block with two flex columns (`statusAndFlowText()`)
+because Hubitat stacks page sections vertically; the columns wrap to one
+above the other on a narrow screen. The separate How it runs section is gone;
+the Status buttons stay underneath.
+
 ## 2.9.0
 New **How it runs** section on the main page (between Status and
 Configuration, shown once the required devices are selected). It lays out the

@@ -32,6 +32,8 @@
  *  ---------------------------------------------------------------------------
  *  CHANGELOG (current version only -- full history in CHANGELOG.md)
  *  ---------------------------------------------------------------------------
+ *  2.9.1  Status and "How it runs" now sit side by side at the top of the main
+ *         page (Status left, How it runs right), stacking on a narrow screen.
  *  2.9.0  New "How it runs" section on the main page: the whole process step by
  *         step (CLEAN -> WAIT -> PULSE -> LR-TIMER -> CYCLING -> CLEAN, or the
  *         robot-timing version), filled in with the configured devices,
@@ -188,7 +190,7 @@
 
 import groovy.transform.Field
 
-@Field static final String APP_VERSION = "2.9.0"
+@Field static final String APP_VERSION = "2.9.1"
 @Field static final Integer HISTORY_MAX = 25
 @Field static final Integer CYCLE_HISTORY_MAX = 10
 
@@ -310,16 +312,10 @@ def mainPage() {
     dynamicPage(name: "mainPage", title: "Litter Robot Cleanup Manager", install: true, uninstall: true) {
 
         section("Status") {
-            paragraph statusText()
+            paragraph statusAndFlowText()
             input "btnReset", "button", title: "Reset to CLEAN now"
             if (enableSwitch && !isEnabled()) {
                 input "btnEnable", "button", title: "Turn auto-clean on"
-            }
-        }
-
-        if (devicesReady()) {
-            section("How it runs") {
-                paragraph processFlowText()
             }
         }
 
@@ -890,6 +886,19 @@ private statusText() {
 }
 
 // ---- "How it runs" (main page) -----------------------------------------------
+
+// Status on the left, How it runs on the right. Hubitat stacks sections one
+// under another, so the two columns are a single HTML block; flex-wrap drops
+// the right column under the left one when the screen is too narrow for both.
+private String statusAndFlowText() {
+    if (!devicesReady()) return statusText()
+    String col = "flex:1 1 320px;min-width:0"
+    return "<div style='display:flex;flex-wrap:wrap;gap:16px 32px;align-items:flex-start'>" +
+           "<div style='${col}'>${statusText()}</div>" +
+           "<div style='${col}'><div style='font-weight:bold;margin-bottom:6px'>How it runs</div>" +
+           "${processFlowText()}</div>" +
+           "</div>"
+}
 
 // The whole process as an ordered list, built from the saved settings and
 // devices, so it always describes what the app will actually do. The step the
